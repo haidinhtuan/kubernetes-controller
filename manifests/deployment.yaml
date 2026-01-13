@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-controller
+  labels:
+    app: k8s-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-controller
+  template:
+    metadata:
+      labels:
+        app: k8s-controller
+    spec:
+      serviceAccountName: k8s-controller
+      containers:
+      - name: controller
+        image: gcr.io/YOUR_PROJECT_ID/k8s-controller:latest
+        imagePullPolicy: Always

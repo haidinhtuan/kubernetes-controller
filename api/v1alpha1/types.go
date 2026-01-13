@@ -1,0 +1,88 @@
+package v1alpha1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// Phase defines the current stage of the migration
+type Phase string
+
+const (
+	PhasePending       Phase = "Pending"
+	PhaseCheckpointing Phase = "Checkpointing"
+	PhaseTransferring  Phase = "Transferring"
+	PhaseRestoring     Phase = "Restoring"
+	PhaseReplaying     Phase = "Replaying"
+	PhaseFinalizing    Phase = "Finalizing"
+	PhaseCompleted     Phase = "Completed"
+	PhaseFailed        Phase = "Failed"
+)
+
+// MessageQueueConfig defines configuration for the message broker
+type MessageQueueConfig struct {
+	// QueueName is the name of the queue to migrate
+	QueueName string `json:"queueName,omitempty"`
+	// BrokerURL is the connection string for the message broker
+	BrokerURL string `json:"brokerUrl,omitempty"`
+}
+
+// StatefulMigrationSpec defines the desired state of StatefulMigration
+type StatefulMigrationSpec struct {
+	// SourcePod is the name of the pod to migrate (must be in the same namespace)
+	SourcePod string `json:"sourcePod,omitempty"`
+	
+	// TargetNode is the optional node selector for the target
+	TargetNode string `json:"targetNode,omitempty"`
+	
+	// CheckpointImageRepository is the registry location to push the checkpoint image
+	CheckpointImageRepository string `json:"checkpointImageRepository,omitempty"`
+	
+	// ReplayCutoffSeconds is the threshold in seconds to trigger the final cutoff
+	ReplayCutoffSeconds int32 `json:"replayCutoffSeconds,omitempty"`
+	
+	// MessageQueueConfig contains details about the messaging system
+	MessageQueueConfig MessageQueueConfig `json:"messageQueueConfig,omitempty"`
+}
+
+// StatefulMigrationStatus defines the observed state of StatefulMigration
+type StatefulMigrationStatus struct {
+	// Phase represents the current phase of the migration
+	Phase Phase `json:"phase,omitempty"`
+	
+	// SourceNode is the node where the source pod is running
+	SourceNode string `json:"sourceNode,omitempty"`
+	
+	// CheckpointID is the identifier of the created checkpoint
+	CheckpointID string `json:"checkpointID,omitempty"`
+	
+	// TargetPod is the name of the restored pod
+	TargetPod string `json:"targetPod,omitempty"`
+	
+	// Conditions represents the latest available observations of the object's state
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+
+// StatefulMigration is the Schema for the statefulmigrations API
+type StatefulMigration struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   StatefulMigrationSpec   `json:"spec,omitempty"`
+	Status StatefulMigrationStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// StatefulMigrationList contains a list of StatefulMigration
+type StatefulMigrationList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []StatefulMigration `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&StatefulMigration{}, &StatefulMigrationList{})
+}
