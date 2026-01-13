@@ -75,3 +75,62 @@ kubectl logs -f deployment/k8s-controller
 ```
 
 You should see output indicating the number of pods in the cluster.
+
+---
+
+## MS2M Controller Implementation Roadmap
+
+This project implements the Message-based Stateful Microservice Migration (MS2M) framework. Below is the high-level plan for implementation and testing.
+
+### 1. Implementation Planning
+
+The development is divided into sequential phases to ensure stability:
+
+*   **Phase 1: Foundation (Completed)**
+    *   Setup Go module, SDKs, and Project Scaffolding.
+    *   Define `StatefulMigration` CRD (v1alpha1).
+    *   Implement the base Reconciler loop and state machine skeleton.
+
+*   **Phase 2: Checkpoint Orchestration**
+    *   **Goal**: Interface with the Kubelet Checkpoint API.
+    *   **Tasks**:
+        *   Implement `KubeletClient` to send `POST /checkpoint` requests.
+        *   Add logic to `handlePending` to trigger checkpointing.
+        *   Verify checkpoint file existence on the source node.
+
+*   **Phase 3: State Transfer & Restoration**
+    *   **Goal**: Move the checkpoint from Node A to Node B via a Registry.
+    *   **Tasks**:
+        *   Implement an ephemeral "Transfer Job" (Pod) that builds an OCI image from the checkpoint tarball.
+        *   Update Controller to launch this Job and monitor its completion.
+        *   Implement logic to create the Target Pod using the new Checkpoint Image.
+
+*   **Phase 4: Message Replay & Switchover**
+    *   **Goal**: Zero-loss synchronization.
+    *   **Tasks**:
+        *   Integrate RabbitMQ/NATS client to handle queue creation and switching.
+        *   Implement `START_REPLAY` and `END_REPLAY` control signals.
+        *   Add "Cutoff" logic: Stop source pod if replay lag > threshold.
+
+### 2. Testing Strategy
+
+We employ a pyramid testing approach:
+
+*   **Unit Tests (Fast Feedback)**
+    *   Focus: State Machine logic.
+    *   Tools: `go test`, `gomock`.
+    *   What: Verify that the controller transitions correctly between phases (e.g., `Pending` -> `Checkpointing`) and handles error states gracefully.
+
+*   **Integration Tests (API Logic)**
+    *   Focus: CRD interaction.
+    *   Tools: `envtest` (controller-runtime).
+    *   What: Verify the Controller can successfully create/update/patch the Custom Resources on a real (simulated) API server.
+
+*   **End-to-End (E2E) Tests (Real World)**
+    *   Focus: Full Migration Success.
+    *   Environment: GKE Cluster with `UBUNTU_CONTAINERD` nodes (for CRIU support).
+    *   Scenario:
+        1.  Deploy a stateful counter app.
+        2.  Generate high-frequency traffic.
+        3.  Trigger Migration.
+        4.  **Assert**: No messages lost, Target Pod resumes count exactly where Source left off.
