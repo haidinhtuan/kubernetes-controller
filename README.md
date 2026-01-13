@@ -16,6 +16,22 @@ This repository contains a simple Kubernetes Controller written in Go, along wit
 - `terraform/`: Terraform configuration to provision GKE.
 - `manifests/`: Kubernetes manifests (Deployment, RBAC).
 
+## Why MS2M? (Overcoming StatefulSet Limitations)
+
+Standard Kubernetes `StatefulSets` handle stable identities and storage but fail to preserve **execution state** (RAM) during rescheduling. When a Pod is moved (e.g., node drain, scaling), it is terminated and restarted, leading to:
+1.  **Memory Loss**: All in-memory data is wiped.
+2.  **Downtime**: The application performs a cold boot and must rebuild cache.
+3.  **Connection Drops**: Active connections are severed without coordination.
+
+This controller implements the **Message-based Stateful Microservice Migration (MS2M)** framework to solve these issues:
+
+| Feature | Standard StatefulSet | MS2M Controller |
+| :--- | :--- | :--- |
+| **Migration Mechanism** | Delete & Recreate (Destructive) | Checkpoint & Restore (Preservative) |
+| **In-Memory State** | Lost | **Preserved** via CRIU (Forensic Container Checkpointing) |
+| **Transfer Method** | Detach/Attach PV (Slow) | **OCI Image** (Fast, Portable) |
+| **Data Consistency** | Crash Recovery | **Message Replay** (Zero-Loss Handoff) |
+
 ## Local Development (Running locally)
 
 You can run the controller locally against a remote cluster or a local cluster (like kind or minikube).
