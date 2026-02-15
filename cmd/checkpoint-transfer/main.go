@@ -1,8 +1,10 @@
 package main
 
 import (
+	"compress/gzip"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
@@ -13,8 +15,10 @@ import (
 )
 
 // buildCheckpointImage creates a single-layer OCI image from a CRIU checkpoint tarball.
+// It skips gzip compression since the image is pushed over a local cluster network
+// where CPU cost of compression outweighs the bandwidth savings.
 func buildCheckpointImage(checkpointPath, containerName string) (v1.Image, error) {
-	layer, err := tarball.LayerFromFile(checkpointPath)
+	layer, err := tarball.LayerFromFile(checkpointPath, tarball.WithCompressionLevel(gzip.NoCompression))
 	if err != nil {
 		return nil, fmt.Errorf("creating layer from checkpoint: %w", err)
 	}
@@ -46,18 +50,29 @@ func main() {
 		containerName = os.Args[3]
 	}
 
+	totalStart := time.Now()
+
 	fmt.Printf("Building checkpoint image from %s\n", checkpointPath)
+	buildStart := time.Now()
 	img, err := buildCheckpointImage(checkpointPath, containerName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error building image: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Printf("Image built in %s\n", time.Since(buildStart))
 
 	fmt.Printf("Pushing image to %s\n", imageRef)
-	if err := crane.Push(img, imageRef, crane.WithAuthFromKeychain(authn.DefaultKeychain)); err != nil {
+	pushStart := time.Now()
+
+	opts := []crane.Option{crane.WithAuthFromKeychain(authn.DefaultKeychain)}
+	if os.Getenv("INSECURE_REGISTRY") != "" {
+		opts = append(opts, crane.Insecure)
+	}
+
+	if err := crane.Push(img, imageRef, opts...); err != nil {
 		fmt.Fprintf(os.Stderr, "error pushing image: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("Checkpoint image pushed successfully")
+	fmt.Printf("Image pushed in %s (total: %s)\n", time.Since(pushStart), time.Since(totalStart))
 }

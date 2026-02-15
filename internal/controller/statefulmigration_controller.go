@@ -36,7 +36,9 @@ type StatefulMigrationReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create
 
 // Reconcile drives the StatefulMigration through its phase-based state machine.
-// Each invocation handles exactly one phase transition (or requeues to wait).
+// Phases that complete synchronously (returning Requeue: true) are chained
+// within a single reconcile call to avoid unnecessary round-trips through the
+// work queue.
 func (r *StatefulMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -46,42 +48,66 @@ func (r *StatefulMigrationReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	logger.Info("Reconciling StatefulMigration", "phase", migration.Status.Phase)
+	// Phase chaining loop: when a handler returns Requeue: true (no delay),
+	// re-fetch and immediately process the next phase instead of returning
+	// to the work queue.
+	for {
+		logger.Info("Reconciling StatefulMigration", "phase", migration.Status.Phase)
 
-	// State Machine
-	switch migration.Status.Phase {
-	case "":
-		// Initial state, move to Pending
-		migration.Status.Phase = migrationv1alpha1.PhasePending
-		if err := r.Status().Update(ctx, migration); err != nil {
-			return ctrl.Result{}, err
+		var result ctrl.Result
+		var err error
+
+		switch migration.Status.Phase {
+		case "":
+			// Initial state, move to Pending
+			patch := client.MergeFrom(migration.DeepCopy())
+			migration.Status.Phase = migrationv1alpha1.PhasePending
+			if err := r.Status().Patch(ctx, migration, patch); err != nil {
+				return ctrl.Result{}, err
+			}
+			result = ctrl.Result{Requeue: true}
+
+		case migrationv1alpha1.PhasePending:
+			result, err = r.handlePending(ctx, migration)
+
+		case migrationv1alpha1.PhaseCheckpointing:
+			result, err = r.handleCheckpointing(ctx, migration)
+
+		case migrationv1alpha1.PhaseTransferring:
+			result, err = r.handleTransferring(ctx, migration)
+
+		case migrationv1alpha1.PhaseRestoring:
+			result, err = r.handleRestoring(ctx, migration)
+
+		case migrationv1alpha1.PhaseReplaying:
+			result, err = r.handleReplaying(ctx, migration)
+
+		case migrationv1alpha1.PhaseFinalizing:
+			result, err = r.handleFinalizing(ctx, migration)
+
+		case migrationv1alpha1.PhaseCompleted, migrationv1alpha1.PhaseFailed:
+			return ctrl.Result{}, nil
+
+		default:
+			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{Requeue: true}, nil
 
-	case migrationv1alpha1.PhasePending:
-		return r.handlePending(ctx, migration)
+		// If error or the handler needs a delayed requeue, return immediately
+		if err != nil || result.RequeueAfter > 0 {
+			return result, err
+		}
 
-	case migrationv1alpha1.PhaseCheckpointing:
-		return r.handleCheckpointing(ctx, migration)
+		// If no requeue requested, we're done (terminal state or explicit stop)
+		if !result.Requeue {
+			return result, nil
+		}
 
-	case migrationv1alpha1.PhaseTransferring:
-		return r.handleTransferring(ctx, migration)
-
-	case migrationv1alpha1.PhaseRestoring:
-		return r.handleRestoring(ctx, migration)
-
-	case migrationv1alpha1.PhaseReplaying:
-		return r.handleReplaying(ctx, migration)
-
-	case migrationv1alpha1.PhaseFinalizing:
-		return r.handleFinalizing(ctx, migration)
-
-	case migrationv1alpha1.PhaseCompleted, migrationv1alpha1.PhaseFailed:
-		// Terminal states, no action
-		return ctrl.Result{}, nil
+		// Requeue: true means the phase completed synchronously. Re-fetch
+		// the resource to get the updated phase and continue the loop.
+		if fetchErr := r.Get(ctx, req.NamespacedName, migration); fetchErr != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(fetchErr)
+		}
 	}
-
-	return ctrl.Result{}, nil
 }
 
 // handlePending validates the migration spec and records initial metadata.
@@ -219,8 +245,9 @@ func (r *StatefulMigrationReconciler) handleTransferring(ctx context.Context, m 
 	if errors.IsNotFound(err) {
 		// Record the phase start when we first create the job
 		if _, ok := m.Status.PhaseTimings["Transferring.start"]; !ok {
+			patch := client.MergeFrom(m.DeepCopy())
 			m.Status.PhaseTimings["Transferring.start"] = time.Now().Format(time.RFC3339)
-			_ = r.Status().Update(ctx, m)
+			_ = r.Status().Patch(ctx, m, patch)
 		}
 
 		// Build the transfer Job spec
@@ -250,6 +277,12 @@ func (r *StatefulMigrationReconciler) handleTransferring(ctx context.Context, m 
 								Image:           "checkpoint-transfer:latest",
 								ImagePullPolicy: corev1.PullIfNotPresent,
 								Args:            []string{m.Status.CheckpointID, imageRef, m.Status.ContainerName},
+								Env: []corev1.EnvVar{
+									{
+										Name:  "INSECURE_REGISTRY",
+										Value: "true",
+									},
+								},
 								SecurityContext: &corev1.SecurityContext{
 									RunAsUser:  func() *int64 { uid := int64(0); return &uid }(),
 									RunAsGroup: func() *int64 { gid := int64(0); return &gid }(),
@@ -280,14 +313,13 @@ func (r *StatefulMigrationReconciler) handleTransferring(ctx context.Context, m 
 
 		if err := r.Create(ctx, job); err != nil {
 			if errors.IsAlreadyExists(err) {
-				// Job was created by a previous reconcile loop; requeue to check its status
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 			return r.failMigration(ctx, m, fmt.Sprintf("create transfer job: %v", err))
 		}
 
 		logger.Info("Created transfer job", "job", jobName)
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 
 	} else if err != nil {
 		return ctrl.Result{}, err
@@ -308,9 +340,9 @@ func (r *StatefulMigrationReconciler) handleTransferring(ctx context.Context, m 
 		return r.transitionPhase(ctx, m, migrationv1alpha1.PhaseRestoring)
 	}
 
-	// Still running
+	// Still running — use exponential backoff based on elapsed time
 	logger.Info("Waiting for transfer job", "job", jobName)
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: r.pollingBackoff(m, "Transferring.start")}, nil
 }
 
 // handleRestoring creates the target pod on the destination node using the
@@ -323,8 +355,9 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 
 	// Record phase start time (only on first entry)
 	if _, ok := m.Status.PhaseTimings["Restoring.start"]; !ok {
+		patch := client.MergeFrom(m.DeepCopy())
 		m.Status.PhaseTimings["Restoring.start"] = time.Now().Format(time.RFC3339)
-		_ = r.Status().Update(ctx, m)
+		_ = r.Status().Patch(ctx, m, patch)
 	}
 
 	// Determine target pod name based on strategy
@@ -350,7 +383,7 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 				if err := r.Delete(ctx, sourcePod); err != nil {
 					return r.failMigration(ctx, m, fmt.Sprintf("delete source pod: %v", err))
 				}
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 			} else if !errors.IsNotFound(srcErr) {
 				return ctrl.Result{}, srcErr
 			}
@@ -408,13 +441,13 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 
 		if err := r.Create(ctx, newPod); err != nil {
 			if errors.IsAlreadyExists(err) {
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 			}
 			return r.failMigration(ctx, m, fmt.Sprintf("create target pod: %v", err))
 		}
 
 		logger.Info("Created target pod", "pod", targetPodName, "node", m.Spec.TargetNode)
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 
 	} else if err != nil {
 		return ctrl.Result{}, err
@@ -423,7 +456,7 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 	// Target pod exists, wait for it to be Running
 	if targetPod.Status.Phase != corev1.PodRunning {
 		logger.Info("Waiting for target pod to become Running", "pod", targetPodName, "phase", targetPod.Status.Phase)
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: r.pollingBackoff(m, "Restoring.start")}, nil
 	}
 
 	// Target pod is Running, record the result and move on
@@ -451,6 +484,7 @@ func (r *StatefulMigrationReconciler) handleReplaying(ctx context.Context, m *mi
 
 	// Record phase start time (only on first entry)
 	if _, ok := m.Status.PhaseTimings["Replaying.start"]; !ok {
+		patch := client.MergeFrom(m.DeepCopy())
 		m.Status.PhaseTimings["Replaying.start"] = time.Now().Format(time.RFC3339)
 
 		// Send the START_REPLAY control message on the first pass
@@ -460,7 +494,7 @@ func (r *StatefulMigrationReconciler) handleReplaying(ctx context.Context, m *mi
 		if err := r.MsgClient.SendControlMessage(ctx, m.Status.TargetPod, messaging.ControlStartReplay, payload); err != nil {
 			return r.failMigration(ctx, m, fmt.Sprintf("send START_REPLAY: %v", err))
 		}
-		_ = r.Status().Update(ctx, m)
+		_ = r.Status().Patch(ctx, m, patch)
 	}
 
 	// Poll the secondary queue depth
@@ -502,8 +536,8 @@ func (r *StatefulMigrationReconciler) handleReplaying(ctx context.Context, m *mi
 		}
 	}
 
-	// Still draining, poll again
-	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	// Still draining — use exponential backoff
+	return ctrl.Result{RequeueAfter: r.pollingBackoff(m, "Replaying.start")}, nil
 }
 
 // handleFinalizing sends END_REPLAY, tears down the secondary queue, and
@@ -567,8 +601,9 @@ func (r *StatefulMigrationReconciler) recordPhaseTiming(m *migrationv1alpha1.Sta
 
 // transitionPhase updates the migration status to the new phase and requeues.
 func (r *StatefulMigrationReconciler) transitionPhase(ctx context.Context, m *migrationv1alpha1.StatefulMigration, newPhase migrationv1alpha1.Phase) (ctrl.Result, error) {
+	patch := client.MergeFrom(m.DeepCopy())
 	m.Status.Phase = newPhase
-	if err := r.Status().Update(ctx, m); err != nil {
+	if err := r.Status().Patch(ctx, m, patch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{Requeue: true}, nil
@@ -579,6 +614,7 @@ func (r *StatefulMigrationReconciler) failMigration(ctx context.Context, m *migr
 	logger := log.FromContext(ctx)
 	logger.Error(fmt.Errorf("%s", reason), "migration failed")
 
+	patch := client.MergeFrom(m.DeepCopy())
 	m.Status.Phase = migrationv1alpha1.PhaseFailed
 	meta.SetStatusCondition(&m.Status.Conditions, metav1.Condition{
 		Type:               "Failed",
@@ -588,10 +624,33 @@ func (r *StatefulMigrationReconciler) failMigration(ctx context.Context, m *migr
 		LastTransitionTime: metav1.Now(),
 	})
 
-	if err := r.Status().Update(ctx, m); err != nil {
+	if err := r.Status().Patch(ctx, m, patch); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+// pollingBackoff computes an exponential backoff interval based on elapsed
+// time since the phase started. Returns 1s initially, doubling up to 5s max.
+func (r *StatefulMigrationReconciler) pollingBackoff(m *migrationv1alpha1.StatefulMigration, startKey string) time.Duration {
+	const (
+		minInterval = 1 * time.Second
+		maxInterval = 5 * time.Second
+	)
+	if startStr, ok := m.Status.PhaseTimings[startKey]; ok {
+		if startTime, err := time.Parse(time.RFC3339, startStr); err == nil {
+			elapsed := time.Since(startTime)
+			switch {
+			case elapsed < 10*time.Second:
+				return minInterval
+			case elapsed < 30*time.Second:
+				return 2 * time.Second
+			default:
+				return maxInterval
+			}
+		}
+	}
+	return minInterval
 }
 
 // SetupWithManager sets up the controller with the Manager.
