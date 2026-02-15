@@ -382,39 +382,34 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 
 	if err == nil {
 		// For Sequential strategy, the target pod name equals the source pod name.
-		// A pod without migration labels could be:
-		//   - The original source pod (not yet deleted) — scale down + delete
-		//   - A pod recreated by the StatefulSet controller — just delete
+		// A pod without migration labels was not created by us (it's either the
+		// original source pod or a pod recreated by the StatefulSet controller).
+		// Scale down the StatefulSet and wait for it to delete the pod.
 		if m.Spec.MigrationStrategy == "Sequential" && targetPod.Labels["migration.ms2m.io/migration"] != m.Name {
-			if m.Status.OriginalReplicas == 0 {
-				// Source pod still exists — scale down StatefulSet first
-				if m.Status.StatefulSetName != "" {
-					sts := &appsv1.StatefulSet{}
-					stsErr := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts)
-					if stsErr == nil && sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 {
-						patch := client.MergeFrom(m.DeepCopy())
-						m.Status.OriginalReplicas = *sts.Spec.Replicas
-						_ = r.Status().Patch(ctx, m, patch)
+			if m.Status.OriginalReplicas == 0 && m.Status.StatefulSetName != "" {
+				// First time: scale down the StatefulSet so it stops recreating pods
+				sts := &appsv1.StatefulSet{}
+				stsErr := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts)
+				if stsErr == nil && sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 {
+					patch := client.MergeFrom(m.DeepCopy())
+					m.Status.OriginalReplicas = *sts.Spec.Replicas
+					_ = r.Status().Patch(ctx, m, patch)
 
-						newReplicas := *sts.Spec.Replicas - 1
-						stsPatch := client.MergeFrom(sts.DeepCopy())
-						sts.Spec.Replicas = &newReplicas
-						if err := r.Patch(ctx, sts, stsPatch); err != nil {
-							return r.failMigration(ctx, m, fmt.Sprintf("scale down StatefulSet %q: %v", m.Status.StatefulSetName, err))
-						}
-						logger.Info("Scaled down StatefulSet", "statefulset", m.Status.StatefulSetName, "replicas", newReplicas)
-					} else if stsErr != nil && !errors.IsNotFound(stsErr) {
-						return ctrl.Result{}, stsErr
+					newReplicas := int32(0)
+					stsPatch := client.MergeFrom(sts.DeepCopy())
+					sts.Spec.Replicas = &newReplicas
+					if err := r.Patch(ctx, sts, stsPatch); err != nil {
+						return r.failMigration(ctx, m, fmt.Sprintf("scale down StatefulSet %q: %v", m.Status.StatefulSetName, err))
 					}
+					logger.Info("Scaled down StatefulSet", "statefulset", m.Status.StatefulSetName, "replicas", newReplicas)
+				} else if stsErr != nil && !errors.IsNotFound(stsErr) {
+					return ctrl.Result{}, stsErr
 				}
-				logger.Info("Deleting source pod for Sequential migration", "pod", targetPodName)
-			} else {
-				logger.Info("Deleting pod recreated by StatefulSet controller", "pod", targetPodName)
 			}
-			if delErr := r.Delete(ctx, targetPod); delErr != nil && !errors.IsNotFound(delErr) {
-				return ctrl.Result{}, delErr
-			}
-			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+			// Wait for the StatefulSet controller to process the scale-down
+			// and delete the pod. Don't delete it ourselves to avoid a race.
+			logger.Info("Waiting for source pod to be removed by StatefulSet controller", "pod", targetPodName)
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
 		// Target pod exists with correct identity, wait for it to be Running
@@ -467,17 +462,25 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 		sourceLabels = m.Status.SourcePodLabels
 	}
 
-	// Build containers: copy source containers with checkpoint image overlay
+	// Build containers: use checkpoint image with ports from source.
+	// Only copy ports from source containers — volume mounts, env vars, and
+	// other fields are either auto-injected by Kubernetes (kube-api-access)
+	// or already baked into the CRIU checkpoint image.
 	var containers []corev1.Container
 	if len(sourceContainers) > 0 {
 		for _, c := range sourceContainers {
-			if c.Name == m.Status.ContainerName {
-				c.Image = checkpointImage
+			restored := corev1.Container{
+				Name:  c.Name,
+				Image: checkpointImage,
+				Ports: c.Ports,
 			}
-			containers = append(containers, c)
+			if c.Name != m.Status.ContainerName {
+				// Non-checkpoint containers keep their original image
+				restored.Image = c.Image
+			}
+			containers = append(containers, restored)
 		}
 	} else {
-		// Minimal fallback: single container with checkpoint image
 		containers = []corev1.Container{
 			{
 				Name:  m.Status.ContainerName,
