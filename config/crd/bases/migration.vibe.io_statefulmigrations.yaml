@@ -43,10 +43,25 @@ spec:
                     description: BrokerURL is the connection string for the message
                       broker
                     type: string
+                  exchangeName:
+                    description: ExchangeName is the exchange the producer publishes
+                      to
+                    type: string
                   queueName:
                     description: QueueName is the name of the queue to migrate
                     type: string
+                  routingKey:
+                    description: RoutingKey is the routing key used for the primary
+                      queue binding
+                    type: string
                 type: object
+              migrationStrategy:
+                description: 'MigrationStrategy determines how to handle pod identity
+                  conflicts. "ShadowPod" creates a shadow pod alongside the source
+                  (for individual pods). "Sequential" deletes source before creating
+                  target (required for StatefulSets). If empty, auto-detected from
+                  ownerReferences.'
+                type: string
               replayCutoffSeconds:
                 description: ReplayCutoffSeconds is the threshold in seconds to trigger
                   the final cutoff
@@ -119,8 +134,18 @@ spec:
               phase:
                 description: Phase represents the current phase of the migration
                 type: string
+              phaseTimings:
+                additionalProperties:
+                  type: string
+                description: PhaseTimings records the duration of each completed
+                  phase
+                type: object
               sourceNode:
                 description: SourceNode is the node where the source pod is running
+                type: string
+              startTime:
+                description: StartTime records when the migration was initiated
+                format: date-time
                 type: string
               targetPod:
                 description: TargetPod is the name of the restored pod
