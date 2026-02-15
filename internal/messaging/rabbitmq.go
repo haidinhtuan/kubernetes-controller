@@ -101,21 +101,18 @@ func (r *RabbitMQClient) CreateSecondaryQueue(_ context.Context, primaryQueue, e
 	return secondaryQueue, nil
 }
 
-// DeleteSecondaryQueue tears down the fan-out setup: unbinds the primary
-// queue, deletes the secondary queue, and removes the exchange.
+// DeleteSecondaryQueue tears down the replay setup: unbinds and deletes
+// the secondary queue. The primary queue binding and the shared exchange
+// are left intact so the producer can continue publishing.
 func (r *RabbitMQClient) DeleteSecondaryQueue(_ context.Context, secondaryQueue, primaryQueue, exchangeName string) error {
-	if err := r.ch.QueueUnbind(primaryQueue, "", exchangeName, nil); err != nil {
-		return fmt.Errorf("unbind primary queue %q from %q: %w", primaryQueue, exchangeName, err)
+	// Unbind only the secondary queue from the fanout exchange
+	if err := r.ch.QueueUnbind(secondaryQueue, "", exchangeName, nil); err != nil {
+		return fmt.Errorf("unbind secondary queue %q from %q: %w", secondaryQueue, exchangeName, err)
 	}
 
 	// Delete the secondary queue
 	if _, err := r.ch.QueueDelete(secondaryQueue, false, false, false); err != nil {
 		return fmt.Errorf("delete queue %q: %w", secondaryQueue, err)
-	}
-
-	// Delete the fanout exchange
-	if err := r.ch.ExchangeDelete(exchangeName, false, false); err != nil {
-		return fmt.Errorf("delete exchange %q: %w", exchangeName, err)
 	}
 
 	return nil

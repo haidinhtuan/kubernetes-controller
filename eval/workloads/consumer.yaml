@@ -35,15 +35,17 @@ spec:
         - |
           pip install -q pika
           cat > /tmp/consumer.py << 'PYEOF'
-          import pika, time, json, os, signal, threading
+          import pika, time, json, os, socket, threading
           from http.server import HTTPServer, BaseHTTPRequestHandler
 
           delay_ms = int(os.environ.get('PROCESSING_DELAY_MS', '50'))
           broker = os.environ.get('RABBITMQ_URL', 'amqp://guest:guest@rabbitmq.rabbitmq.svc.cluster.local:5672/')
-          queue = os.environ.get('QUEUE_NAME', 'app.events')
+          primary_queue = os.environ.get('QUEUE_NAME', 'app.events')
 
           # In-memory state (this is what CRIU preserves)
           state = {"processed": 0, "last_seq": -1}
+          # MS2M replay state
+          replay_state = {"active": False, "queue": None}
 
           class Handler(BaseHTTPRequestHandler):
               def do_GET(self):
@@ -57,23 +59,87 @@ spec:
           srv = HTTPServer(('', 8080), Handler)
           threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-          conn = pika.BlockingConnection(pika.URLParameters(broker))
-          ch = conn.channel()
-          ch.queue_declare(queue=queue, durable=True)
-          ch.basic_qos(prefetch_count=1)
+          def check_control_messages(ch, ctrl_queue):
+              """Drain pending control messages from the control queue."""
+              while True:
+                  method, props, body = ch.basic_get(queue=ctrl_queue, auto_ack=True)
+                  if method is None:
+                      break
+                  try:
+                      msg = json.loads(body)
+                      msg_type = msg.get('type', '')
+                      if msg_type == 'START_REPLAY':
+                          replay_state['active'] = True
+                          replay_state['queue'] = msg.get('payload', {}).get('queue')
+                          print(f"MS2M: START_REPLAY received, switching to {replay_state['queue']}", flush=True)
+                      elif msg_type == 'END_REPLAY':
+                          replay_state['active'] = False
+                          replay_state['queue'] = None
+                          print(f"MS2M: END_REPLAY received, switching back to {primary_queue}", flush=True)
+                  except Exception as e:
+                      print(f"MS2M: error parsing control message: {e}", flush=True)
 
-          def callback(ch, method, properties, body):
-              msg = json.loads(body)
-              time.sleep(delay_ms / 1000.0)
-              state["processed"] += 1
-              state["last_seq"] = msg.get("seq", -1)
-              if state["processed"] % 100 == 0:
-                  print(f"Processed {state['processed']} messages, last_seq={state['last_seq']}", flush=True)
-              ch.basic_ack(delivery_tag=method.delivery_tag)
+          def run():
+              while True:
+                  try:
+                      # Re-evaluate hostname on each reconnect so CRIU-restored
+                      # processes pick up the new pod name (e.g. shadow pod).
+                      hostname = socket.gethostname()
+                      ctrl_queue = f'ms2m.control.{hostname}'
 
-          print(f"Consuming from {queue}, delay={delay_ms}ms", flush=True)
-          ch.basic_consume(queue=queue, on_message_callback=callback)
-          ch.start_consuming()
+                      conn = pika.BlockingConnection(pika.URLParameters(broker))
+                      ch = conn.channel()
+
+                      # Declare and check control queue for pending messages
+                      ch.queue_declare(queue=ctrl_queue, durable=True)
+                      check_control_messages(ch, ctrl_queue)
+
+                      # Determine which queue to consume from
+                      consume_queue = replay_state['queue'] if replay_state['active'] else primary_queue
+                      ch.queue_declare(queue=consume_queue, durable=True)
+                      ch.basic_qos(prefetch_count=1)
+
+                      print(f"Consuming from {consume_queue}, delay={delay_ms}ms, replay_active={replay_state['active']}", flush=True)
+
+                      def callback(ch, method, properties, body):
+                          msg = json.loads(body)
+                          time.sleep(delay_ms / 1000.0)
+                          state["processed"] += 1
+                          state["last_seq"] = msg.get("seq", -1)
+                          if state["processed"] % 100 == 0:
+                              print(f"Processed {state['processed']} messages, last_seq={state['last_seq']}", flush=True)
+                          ch.basic_ack(delivery_tag=method.delivery_tag)
+
+                      consumer_tag = ch.basic_consume(queue=consume_queue, on_message_callback=callback)
+
+                      # Poll-based loop: process messages and periodically check control queue
+                      while True:
+                          conn.process_data_events(time_limit=1)
+
+                          # Check for control messages
+                          old_active = replay_state['active']
+                          old_queue = replay_state.get('queue')
+                          check_control_messages(ch, ctrl_queue)
+
+                          # If replay state changed, switch queues
+                          if replay_state['active'] != old_active or replay_state.get('queue') != old_queue:
+                              ch.basic_cancel(consumer_tag)
+                              new_queue = replay_state['queue'] if replay_state['active'] else primary_queue
+                              ch.queue_declare(queue=new_queue, durable=True)
+                              consumer_tag = ch.basic_consume(queue=new_queue, on_message_callback=callback)
+                              print(f"Switched to consuming from {new_queue}", flush=True)
+
+                  except pika.exceptions.AMQPConnectionError as e:
+                      print(f"AMQP connection error: {e}, reconnecting in 3s...", flush=True)
+                      time.sleep(3)
+                  except pika.exceptions.AMQPChannelError as e:
+                      print(f"AMQP channel error: {e}, reconnecting in 3s...", flush=True)
+                      time.sleep(3)
+                  except Exception as e:
+                      print(f"Unexpected error: {e}, reconnecting in 3s...", flush=True)
+                      time.sleep(3)
+
+          run()
           PYEOF
           exec python3 /tmp/consumer.py
         env:
