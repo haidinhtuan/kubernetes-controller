@@ -33,3 +33,13 @@ Thumbs.db
 .terraform/
 *.tfstate
 *.tfstate.backup
+
+# Build artifacts
+main
+
+# Reference documents
+instruction/
+Dissertation_Final.pdf
+
+# Coverage
+cover.out
