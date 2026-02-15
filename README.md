@@ -1,188 +1,351 @@
-# Kubernetes Controller Demo
+# MS2M Controller
 
-This repository contains a simple Kubernetes Controller written in Go, along with Terraform code to provision a GKE cluster.
+A Kubernetes controller for live migration of stateful microservices between nodes. It uses CRIU-based container checkpointing and message replay to preserve in-memory state and ensure zero message loss during pod migration.
+
+This project implements the **Message-based Stateful Microservice Migration (MS2M)** framework, originally developed as part of a master's thesis on live migration of stateful microservices in Kubernetes environments.
+
+## Table of Contents
+
+- [Motivation](#motivation)
+- [Architecture](#architecture)
+- [Migration Phases](#migration-phases)
+- [CRD Reference](#crd-reference)
+- [Migration Strategies](#migration-strategies)
+- [Quick Start](#quick-start)
+- [Prerequisites](#prerequisites)
+- [Project Structure](#project-structure)
+- [Building](#building)
+- [Development](#development)
+- [Evaluation](#evaluation)
+- [License](#license)
+
+## Motivation
+
+Standard Kubernetes StatefulSets provide stable identities and persistent storage, but they do not preserve **execution state** (in-memory data) when pods are rescheduled. A pod eviction or node drain causes cold restarts, connection drops, and loss of all cached data.
+
+MS2M addresses this gap:
+
+| Aspect | StatefulSet (default) | MS2M Controller |
+|:---|:---|:---|
+| **Migration mechanism** | Delete and recreate (destructive) | Checkpoint and restore (preservative) |
+| **In-memory state** | Lost | Preserved via CRIU |
+| **Transfer method** | Detach/attach PV | OCI image (fast, portable) |
+| **Pod coexistence** | Impossible (name collision) | Shadow pods (`pod-shadow`) |
+| **Data consistency** | Crash recovery | Message replay (zero-loss handoff) |
+
+## Architecture
+
+The controller follows a **Controller + Transfer Job** pattern with four cooperating actors:
+
+```
+                  Kubernetes API Server
+                 /          |          \
+                /           |           \
+    +-----------+   +---------------+   +------------+
+    | Controller|   | Transfer Job  |   |  Registry  |
+    | (manager) |   | (source node) |   |  (OCI)     |
+    +-----------+   +---------------+   +------------+
+         |                  |                  |
+         |   +-----------+  |  +-----------+   |
+         +-->| Source     |--+  | Target    |<--+
+             | Kubelet   |     | Kubelet   |
+             | (Node A)  |     | (Node B)  |
+             +-----------+     +-----------+
+```
+
+- **Controller** -- Runs as a Deployment in the cluster. Watches `StatefulMigration` custom resources and drives the state machine through each migration phase by interacting with the Kubernetes API.
+- **Source Kubelet** -- Executes the CRIU checkpoint on the source node via the kubelet checkpoint API (`POST /checkpoint/{namespace}/{pod}/{container}`), proxied through the API server.
+- **Transfer Job** -- An ephemeral pod scheduled on the source node with access to the local checkpoint archive. It packages the checkpoint tarball as a single-layer OCI image and pushes it to the container registry.
+- **Target Kubelet** -- Pulls the checkpoint image from the registry and restores the container with its full in-memory state on the target node.
+
+## Migration Phases
+
+A `StatefulMigration` resource progresses through five phases, each handled by a dedicated phase handler in the reconciler:
+
+```
+ +-----------+     +----------------+     +--------------+
+ |  Pending  |---->| Checkpointing  |---->| Transferring |
+ +-----------+     +----------------+     +--------------+
+                                                |
+                                                v
+                   +--------------+     +--------------+
+                   |  Finalizing  |<----| Restoring    |
+                   +--------------+     +--------------+
+                         |                      |
+                         v                      v
+                   +-----------+         +-----------+
+                   | Completed |         | Replaying |---+
+                   +-----------+         +-----------+   |
+                                               ^         |
+                                               +---------+
+                                            (monitor lag)
+```
+
+### Phase 1: Checkpointing
+
+The controller creates a secondary message queue (fan-out) so that new messages arriving after this point are duplicated to both the primary and replay queues. It then calls the kubelet checkpoint API on the source node to create a CRIU checkpoint of the running container.
+
+### Phase 2: Transferring
+
+A Transfer Job pod is scheduled on the source node. It reads the checkpoint tarball from the local filesystem, packages it as a single-layer OCI image using [go-containerregistry](https://github.com/google/go-containerregistry), and pushes it to the configured container registry.
+
+### Phase 3: Restoring
+
+The controller creates a new pod on the target node using the checkpoint image. Depending on the migration strategy, this may be a shadow pod (running alongside the source) or a replacement pod (created after the source is deleted).
+
+### Phase 4: Replaying
+
+The controller sends a `START_REPLAY` control message to the target pod, instructing it to consume and process messages from the secondary replay queue. The controller monitors the replay queue depth and triggers cutoff when the lag falls below the configured `replayCutoffSeconds` threshold.
+
+### Phase 5: Finalizing
+
+The controller sends an `END_REPLAY` control message, switches traffic from the source to the target pod, deletes the source pod, tears down the secondary queue and fan-out exchange, and marks the migration as `Completed`.
+
+## CRD Reference
+
+The controller defines a single Custom Resource: `StatefulMigration` in API group `migration.vibe.io/v1alpha1`.
+
+### Spec
+
+```yaml
+apiVersion: migration.vibe.io/v1alpha1
+kind: StatefulMigration
+metadata:
+  name: migrate-worker-0
+  namespace: default
+spec:
+  # Name of the pod to migrate (must be in the same namespace)
+  sourcePod: worker-0
+
+  # Target node for the restored pod (optional; uses scheduler if omitted)
+  targetNode: node-b
+
+  # Registry location to push the checkpoint OCI image
+  checkpointImageRepository: registry.example.com/checkpoints/worker-0
+
+  # Seconds of replay lag below which to trigger final cutoff
+  replayCutoffSeconds: 5
+
+  # Message queue configuration for replay
+  messageQueueConfig:
+    queueName: tasks
+    brokerUrl: amqp://rabbitmq.default.svc:5672
+    exchangeName: tasks.fanout
+    routingKey: tasks
+
+  # Migration strategy: "ShadowPod" or "Sequential" (auto-detected if omitted)
+  migrationStrategy: ShadowPod
+```
+
+### Status
+
+The controller populates the following status fields during the migration:
+
+| Field | Type | Description |
+|:---|:---|:---|
+| `phase` | string | Current migration phase (`Pending`, `Checkpointing`, `Transferring`, `Restoring`, `Replaying`, `Finalizing`, `Completed`, `Failed`) |
+| `sourceNode` | string | Node where the source pod is running |
+| `checkpointID` | string | Identifier of the created CRIU checkpoint |
+| `targetPod` | string | Name of the restored pod on the target node |
+| `startTime` | datetime | Timestamp when the migration was initiated |
+| `phaseTimings` | map[string]string | Duration of each completed phase |
+| `conditions` | []Condition | Standard Kubernetes conditions for detailed status |
+
+## Migration Strategies
+
+### ShadowPod (default for standalone pods)
+
+The controller creates a shadow pod (e.g., `worker-0-shadow`) on the target node while the source pod is still running. Both pods coexist during the replay phase, ensuring the target can catch up before traffic is switched. This is the default strategy for pods that are not owned by a StatefulSet.
+
+### Sequential (required for StatefulSets)
+
+StatefulSet pods have strict identity requirements -- `worker-0` cannot exist as two pods simultaneously. The Sequential strategy deletes the source pod before creating the target pod with the same identity. This avoids name collisions but introduces a brief period where the pod is unavailable.
+
+### Auto-detection
+
+If `migrationStrategy` is left empty, the controller inspects the source pod's `ownerReferences`:
+- If owned by a StatefulSet, the strategy defaults to `Sequential`.
+- Otherwise, it defaults to `ShadowPod`.
+
+## Quick Start
+
+### 1. Install the CRD
+
+```bash
+kubectl apply -f config/crd/bases/migration.vibe.io_statefulmigrations.yaml
+```
+
+### 2. Deploy the controller
+
+```bash
+kubectl apply -f config/rbac/role.yaml
+kubectl apply -f config/manager/manager.yaml
+```
+
+### 3. Create a migration
+
+```yaml
+apiVersion: migration.vibe.io/v1alpha1
+kind: StatefulMigration
+metadata:
+  name: migrate-worker-0
+  namespace: default
+spec:
+  sourcePod: worker-0
+  targetNode: node-b
+  checkpointImageRepository: registry.example.com/checkpoints/worker-0
+  replayCutoffSeconds: 5
+  messageQueueConfig:
+    queueName: tasks
+    brokerUrl: amqp://rabbitmq.default.svc:5672
+    exchangeName: tasks.fanout
+    routingKey: tasks
+```
+
+```bash
+kubectl apply -f migration.yaml
+```
+
+### 4. Monitor progress
+
+```bash
+# Watch migration status
+kubectl get statefulmigration migrate-worker-0 -w
+
+# Inspect detailed status
+kubectl describe statefulmigration migrate-worker-0
+```
 
 ## Prerequisites
 
-- Go 1.25+
-- Docker
-- Terraform
-- Google Cloud SDK (`gcloud`)
+- **Kubernetes 1.30+** with the `ContainerCheckpoint` feature gate enabled
+- **CRI-O** or **containerd** configured with CRIU support for container checkpointing
+- **Container registry** accessible from all cluster nodes (for checkpoint image transfer)
+- **RabbitMQ** (or compatible AMQP 0-9-1 broker) for message queue operations
+- **Go 1.25+** (for building from source)
 
 ## Project Structure
 
-- `main.go`: The source code for the controller.
-- `Dockerfile`: Instructions to build the container image.
-- `terraform/`: Terraform configuration to provision GKE.
-- `manifests/`: Kubernetes manifests (Deployment, RBAC).
-
-## Why MS2M? (Overcoming StatefulSet Limitations)
-
-Standard Kubernetes `StatefulSets` handle stable identities and storage but fail to preserve **execution state** (RAM) during rescheduling. When a Pod is moved (e.g., node drain, scaling), it is terminated and restarted, leading to:
-1.  **Memory Loss**: All in-memory data is wiped.
-2.  **Downtime**: The application performs a cold boot and must rebuild cache.
-3.  **Connection Drops**: Active connections are severed without coordination.
-
-This controller implements the **Message-based Stateful Microservice Migration (MS2M)** framework to solve these issues:
-
-| Feature | Standard StatefulSet | MS2M Controller |
-| :--- | :--- | :--- |
-| **Migration Mechanism** | Delete & Recreate (Destructive) | Checkpoint & Restore (Preservative) |
-| **In-Memory State** | Lost | **Preserved** via CRIU (Forensic Container Checkpointing) |
-| **Transfer Method** | Detach/Attach PV (Slow) | **OCI Image** (Fast, Portable) |
-| **Coexistence** | Impossible (Name Collision) | **Shadow Pods** (Target runs as `pod-xyz-shadow`) |
-| **Data Consistency** | Crash Recovery | **Message Replay** (Zero-Loss Handoff) |
-
-### The "Two Instances" Problem
-A major limitation of StatefulSets is that `app-0` cannot exist on two nodes simultaneously. MS2M overcomes this using a **Shadow Pod Strategy**:
-1.  **Source**: `app-0` (Running on Node A).
-2.  **Target**: Controller creates a standalone pod named `app-0-shadow` (on Node B).
-3.  **Sync**: `app-0-shadow` restores memory and replays messages while `app-0` is frozen.
-4.  **Switch**: Once synchronized, traffic is routed to `app-0-shadow`, and `app-0` is terminated.
-
-## Local Development (Running locally)
-
-You can run the controller locally against a remote cluster or a local cluster (like kind or minikube).
-
-1. Ensure your `~/.kube/config` is pointing to the correct cluster.
-2. Run the controller:
-   ```bash
-   go run main.go
-   ```
-
-## Deploying to GKE
-
-### 1. Prerequisites & Tooling
-
-Before starting, ensure you have the following installed on your local machine:
-- **Google Cloud SDK (`gcloud`)**: [Installation Guide](https://cloud.google.com/sdk/docs/install)
-- **Terraform**: [Installation Guide](https://developer.hashicorp.com/terraform/downloads)
-- **kubectl**: Install via `gcloud components install kubectl`
-
-### 2. Google Cloud Platform Setup
-
-1.  **Create a Project**: Create a new project in the [Google Cloud Console](https://console.cloud.google.com/).
-2.  **Enable Billing**: Ensure billing is active for the project.
-3.  **Enable APIs**: Enable the Kubernetes Engine API:
-    ```bash
-    gcloud services enable container.googleapis.com
-    ```
-4.  **Authenticate**:
-    ```bash
-    gcloud auth login
-    gcloud auth application-default login
-    ```
-
-### 3. Provision Infrastructure (Terraform)
-
-The Terraform configuration is optimized for MS2M, using `UBUNTU_CONTAINERD` nodes to support CRIU checkpointing.
-
-1.  **Navigate to the terraform directory**:
-    ```bash
-    cd terraform
-    ```
-2.  **Initialize and Apply**:
-    ```bash
-    export PROJECT_ID="your-project-id"
-    terraform init
-    terraform apply -var="project_id=$PROJECT_ID"
-    ```
-3.  **Connect to the Cluster**:
-    ```bash
-    gcloud container clusters get-credentials my-k8s-controller-cluster --region us-central1-a
-    ```
-4.  **Verify Nodes**:
-    ```bash
-    kubectl get nodes
-    ```
-
-### 4. Build and Push Image
-
-Build the Docker image and push it to Google Container Registry (GCR) or Artifact Registry.
-
-```bash
-export PROJECT_ID=YOUR_PROJECT_ID
-docker build -t gcr.io/$PROJECT_ID/k8s-controller:latest .
-docker push gcr.io/$PROJECT_ID/k8s-controller:latest
+```
+cmd/main.go                          Controller entry point
+cmd/checkpoint-transfer/             Transfer binary (OCI image builder)
+api/v1alpha1/                        CRD type definitions and deepcopy
+  types.go                           StatefulMigration spec/status structs
+  groupversion_info.go               API group registration
+  deepcopy.go                        Generated deep copy functions
+internal/controller/                 Reconciler and phase handlers
+  statefulmigration_controller.go    Main reconciliation loop (state machine)
+internal/kubelet/                    Kubelet checkpoint API client
+  client.go                          Checkpoint request via API server proxy
+internal/messaging/                  Message broker interface and implementations
+  client.go                          BrokerClient interface definition
+  rabbitmq.go                        RabbitMQ (AMQP 0-9-1) implementation
+  mock.go                            In-memory mock for unit tests
+config/crd/bases/                    CRD YAML (OpenAPI v3 schema)
+config/rbac/                         RBAC ClusterRole for the controller
+config/manager/                      Controller Deployment manifest
+manifests/                           Legacy Kubernetes manifests
+terraform/                           GKE cluster provisioning (Terraform)
+docs/                                Design documents and plans
 ```
 
-### 3. Deploy Controller
-
-Update `manifests/deployment.yaml` with your image name (`gcr.io/YOUR_PROJECT_ID/k8s-controller:latest`).
-
-Apply the manifests:
+## Building
 
 ```bash
-kubectl apply -f manifests/rbac.yaml
-kubectl apply -f manifests/deployment.yaml
+# Build the controller binary
+make build
+
+# Build the Docker image (runs tests first)
+make docker-build
+
+# Build with a custom image tag
+make docker-build IMG=registry.example.com/ms2m-controller:v0.1.0
+
+# Push the image to a registry
+make docker-push IMG=registry.example.com/ms2m-controller:v0.1.0
+
+# Build the checkpoint transfer image
+docker build -t checkpoint-transfer:latest -f Dockerfile.transfer .
 ```
 
-### 4. Verify
+## Development
 
-Check the logs of the controller:
+### Running locally
+
+The controller can run outside the cluster for development, using your local kubeconfig:
 
 ```bash
-kubectl get pods
-kubectl logs -f deployment/k8s-controller
+# Ensure your kubeconfig points to the target cluster
+kubectl cluster-info
+
+# Install the CRD
+kubectl apply -f config/crd/bases/migration.vibe.io_statefulmigrations.yaml
+
+# Run the controller
+make run
 ```
 
-You should see output indicating the number of pods in the cluster.
+### Running tests
 
----
+```bash
+# Run all tests with coverage
+make test
 
-## MS2M Controller Implementation Roadmap
+# Run tests for a specific package
+go test ./internal/messaging/... -v
+go test ./internal/kubelet/... -v
+go test ./cmd/checkpoint-transfer/... -v
+```
 
-This project implements the Message-based Stateful Microservice Migration (MS2M) framework. Below is the high-level plan for implementation and testing.
+### Code formatting and vetting
 
-### 1. Implementation Planning
+```bash
+make fmt
+make vet
+```
 
-The development is divided into sequential phases to ensure stability:
+### Deploying to a cluster
 
-*   **Phase 1: Foundation (Completed)**
-    *   Setup Go module, SDKs, and Project Scaffolding.
-    *   Define `StatefulMigration` CRD (v1alpha1).
-    *   Implement the base Reconciler loop and state machine skeleton.
+1. Build and push the controller and transfer images:
 
-*   **Phase 2: Checkpoint Orchestration**
-    *   **Goal**: Interface with the Kubelet Checkpoint API.
-    *   **Tasks**:
-        *   Implement `KubeletClient` to send `POST /checkpoint` requests.
-        *   Add logic to `handlePending` to trigger checkpointing.
-        *   Verify checkpoint file existence on the source node.
+```bash
+export REGISTRY=registry.example.com
+make docker-build IMG=$REGISTRY/ms2m-controller:latest
+make docker-push IMG=$REGISTRY/ms2m-controller:latest
+docker build -t $REGISTRY/checkpoint-transfer:latest -f Dockerfile.transfer .
+docker push $REGISTRY/checkpoint-transfer:latest
+```
 
-*   **Phase 3: State Transfer & Restoration**
-    *   **Goal**: Move the checkpoint from Node A to Node B via a Registry.
-    *   **Tasks**:
-        *   Implement an ephemeral "Transfer Job" (Pod) that builds an OCI image from the checkpoint tarball.
-        *   Update Controller to launch this Job and monitor its completion.
-        *   Implement logic to create the Target Pod using the new Checkpoint Image.
+2. Update `config/manager/manager.yaml` with your image reference.
 
-*   **Phase 4: Message Replay & Switchover**
-    *   **Goal**: Zero-loss synchronization.
-    *   **Tasks**:
-        *   Integrate RabbitMQ/NATS client to handle queue creation and switching.
-        *   Implement `START_REPLAY` and `END_REPLAY` control signals.
-        *   Add "Cutoff" logic: Stop source pod if replay lag > threshold.
+3. Apply all resources:
 
-### 2. Testing Strategy
+```bash
+kubectl apply -f config/crd/bases/migration.vibe.io_statefulmigrations.yaml
+kubectl apply -f config/rbac/role.yaml
+kubectl apply -f config/manager/manager.yaml
+```
 
-We employ a pyramid testing approach:
+4. Verify the controller is running:
 
-*   **Unit Tests (Fast Feedback)**
-    *   Focus: State Machine logic.
-    *   Tools: `go test`, `gomock`.
-    *   What: Verify that the controller transitions correctly between phases (e.g., `Pending` -> `Checkpointing`) and handles error states gracefully.
+```bash
+kubectl get pods -l control-plane=controller-manager
+kubectl logs -l control-plane=controller-manager -f
+```
 
-*   **Integration Tests (API Logic)**
-    *   Focus: CRD interaction.
-    *   Tools: `envtest` (controller-runtime).
-    *   What: Verify the Controller can successfully create/update/patch the Custom Resources on a real (simulated) API server.
+## Evaluation
 
-*   **End-to-End (E2E) Tests (Real World)**
-    *   Focus: Full Migration Success.
-    *   Environment: GKE Cluster with `UBUNTU_CONTAINERD` nodes (for CRIU support).
-    *   Scenario:
-        1.  Deploy a stateful counter app.
-        2.  Generate high-frequency traffic.
-        3.  Trigger Migration.
-        4.  **Assert**: No messages lost, Target Pod resumes count exactly where Source left off.
+The evaluation infrastructure uses bare-metal IONOS cloud VMs provisioned with `kubeadm`. The cluster runs CRI-O as the container runtime with CRIU compiled from source to support forensic container checkpointing.
+
+The test workload is a stateful message-processing microservice backed by RabbitMQ. Evaluation scenarios measure:
+
+- **Checkpoint duration** -- time to freeze and serialize container state
+- **Transfer duration** -- time to package and push the OCI checkpoint image
+- **Restore duration** -- time to pull the image and resume the container
+- **Replay lag** -- time to drain the secondary queue and reach consistency
+- **Total downtime** -- end-to-end unavailability window as perceived by clients
+- **Message loss** -- number of messages dropped during migration (target: zero)
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
