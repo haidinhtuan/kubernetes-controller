@@ -631,3 +631,109 @@ func TestReconcile_Restoring_ShadowPod_PodRunning(t *testing.T) {
 		t.Error("expected Requeue after transition to Replaying")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Integration tests (require envtest)
+// ---------------------------------------------------------------------------
+
+func TestIntegration_CreateMigration_SetsPending(t *testing.T) {
+	if cfg == nil {
+		t.Skip("envtest not available, skipping integration test")
+	}
+
+	// Create a real client from the envtest config
+	k8sClient, err := client.New(cfg, client.Options{Scheme: testScheme()})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Create a migration CR
+	migration := &migrationv1alpha1.StatefulMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "integration-test-1",
+			Namespace: "default",
+		},
+		Spec: migrationv1alpha1.StatefulMigrationSpec{
+			SourcePod:                 "app-0",
+			TargetNode:                "node-2",
+			CheckpointImageRepository: "registry.example.com/checkpoints",
+			ReplayCutoffSeconds:       120,
+			MessageQueueConfig: migrationv1alpha1.MessageQueueConfig{
+				BrokerURL:    "amqp://localhost:5672",
+				QueueName:    "app.events",
+				ExchangeName: "app.fanout",
+			},
+		},
+	}
+
+	err = k8sClient.Create(ctx, migration)
+	if err != nil {
+		t.Fatalf("failed to create migration: %v", err)
+	}
+	defer k8sClient.Delete(ctx, migration)
+
+	// Set up reconciler with mock messaging
+	mockMsg := messaging.NewMockBrokerClient()
+	reconciler := &StatefulMigrationReconciler{
+		Client:    k8sClient,
+		Scheme:    testScheme(),
+		MsgClient: mockMsg,
+	}
+
+	// Reconcile -- should set phase to Pending
+	result, err := reconciler.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "integration-test-1",
+			Namespace: "default",
+		},
+	})
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if !result.Requeue {
+		t.Error("expected requeue after initial reconcile")
+	}
+
+	// Verify the status was updated
+	updated := &migrationv1alpha1.StatefulMigration{}
+	err = k8sClient.Get(ctx, types.NamespacedName{Name: "integration-test-1", Namespace: "default"}, updated)
+	if err != nil {
+		t.Fatalf("failed to get updated migration: %v", err)
+	}
+	if updated.Status.Phase != migrationv1alpha1.PhasePending {
+		t.Errorf("expected phase Pending, got %s", updated.Status.Phase)
+	}
+}
+
+func TestIntegration_MigrationNotFound_NoError(t *testing.T) {
+	if cfg == nil {
+		t.Skip("envtest not available, skipping integration test")
+	}
+
+	k8sClient, err := client.New(cfg, client.Options{Scheme: testScheme()})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	reconciler := &StatefulMigrationReconciler{
+		Client:    k8sClient,
+		Scheme:    testScheme(),
+		MsgClient: messaging.NewMockBrokerClient(),
+	}
+
+	// Reconcile a non-existent resource
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "does-not-exist",
+			Namespace: "default",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected no error for missing resource, got: %v", err)
+	}
+	if result.Requeue {
+		t.Error("should not requeue for missing resource")
+	}
+}
