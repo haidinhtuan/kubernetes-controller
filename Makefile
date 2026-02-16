@@ -54,3 +54,13 @@ docker-build: test ## Build docker image with the manager.
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	docker push ${IMG}
+
+##@ Agent
+
+.PHONY: agent-build
+agent-build: ## Build ms2m-agent binary.
+	go build -o bin/ms2m-agent ./cmd/ms2m-agent
+
+.PHONY: agent-docker-build
+agent-docker-build: ## Build docker image for ms2m-agent.
+	docker build -f Dockerfile.agent -t ms2m-agent:latest .
