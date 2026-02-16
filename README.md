@@ -14,7 +14,7 @@ Standard Kubernetes mechanisms (e.g., pod eviction, node drain, StatefulSet resc
 
 MS2M addresses this gap by introducing a **preservative migration** model. The controller checkpoints a running container's full process state via CRIU (Checkpoint/Restore In Userspace), transfers the checkpoint as an OCI image to a target node, and restores the container with its complete memory, file descriptors, and execution context intact. Concurrently, a fan-out message queue ensures that messages published during the migration window are duplicated to a secondary replay queue, which the restored container drains before assuming primary duties.
 
-This project implements the MS2M framework as described in a master's thesis on live migration of stateful microservices in Kubernetes environments. The controller is built on the [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) framework and defines a single Custom Resource Definition (`StatefulMigration`) that drives a phase-based state machine through the entire migration lifecycle.
+This project implements the MS2M framework as described in [Dinh-Tuan & Jiang (2025)](https://ieeexplore.ieee.org/abstract/document/10942720), building on the original [MS2M concept (2022)](https://ieeexplore.ieee.org/abstract/document/9766576). The controller is built on the [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) framework and defines a single Custom Resource Definition (`StatefulMigration`) that drives a phase-based state machine through the entire migration lifecycle.
 
 ## Architecture
 
@@ -386,6 +386,22 @@ The evaluation infrastructure targets bare-metal cloud VMs provisioned with `kub
 - **Replay duration** -- Time to drain the secondary queue and reach consistency
 - **Total downtime** -- End-to-end unavailability as perceived by clients
 - **Message loss** -- Number of messages dropped during migration (target: zero)
+
+## Related Publications
+
+This controller is the engineering realization of a multi-year research effort on live migration of stateful microservices. The two key publications that inform this work are:
+
+1. **H. Dinh-Tuan and F. Beierle**, "MS2M: A Message-Based Approach for Live Stateful Microservices Migration," *2022 5th Conference on Cloud and Internet of Things (CIoT)*, 2022. [[IEEE]](https://ieeexplore.ieee.org/abstract/document/9766576)
+
+   This paper introduced the core MS2M concept: instead of treating microservices as opaque containers and relying on low-level memory transfer, MS2M leverages the application's existing messaging infrastructure to reconstruct state on the target host. The proof-of-concept, built on Podman and raw CRIU, demonstrated a **19.92% reduction in service downtime** compared to traditional stop-and-copy migration. The key insight is that communication-aware migration -- one that understands an application's message flows -- offers a fundamentally different trade-off: it exchanges a brief checkpoint pause for background state synchronization via message replay, keeping the service available throughout most of the migration.
+
+2. **H. Dinh-Tuan and J. Jiang**, "Optimizing Stateful Microservice Migration in Kubernetes with MS2M and Forensic Checkpointing," *2025 28th Conference on Innovation in Clouds, Internet and Networks (ICIN)*, 2025. [[IEEE]](https://ieeexplore.ieee.org/abstract/document/10942720)
+
+   This follow-up paper bridges the gap between the MS2M concept and production Kubernetes environments. It integrates Kubernetes' native Forensic Container Checkpointing (FCC) feature as the checkpoint mechanism, extends the procedure to support StatefulSet-managed pods (which cannot coexist with duplicate identities), and introduces a **Threshold-Based Cutoff Mechanism** that bounds the replay phase to guarantee predictable migration times under high message rates. The evaluation on a Kubernetes cluster demonstrated up to **96.99% downtime reduction** compared to cold migration, while the cutoff mechanism reduced total migration time by 81.81% at high load compared to unbounded replay.
+
+### How This Controller Fits
+
+This repository implements the system described in Paper 2. The original research prototypes used a Python-based Migration Manager issuing imperative commands via Podman or Kubernetes APIs. This controller replaces that with a production-grade, declarative Kubernetes operator: migrations are expressed as `StatefulMigration` custom resources, and a reconciliation loop drives the five-phase state machine (checkpoint, transfer, restore, replay, finalize) through the Kubernetes control plane. The controller also introduces OCI registry-based checkpoint transfer (replacing Rsync/SSH), automatic StatefulSet strategy detection, fan-out exchange-based message duplication, and exponential backoff polling -- none of which were part of the original research prototypes.
 
 ## License
 
