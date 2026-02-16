@@ -3019,3 +3019,156 @@ func TestReconcile_Finalizing_ShadowPod_PatchesDeployment(t *testing.T) {
 		t.Errorf("expected values [%q], got %v", "node-2", expr.Values)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Direct transfer mode tests
+// ---------------------------------------------------------------------------
+
+func TestReconcile_Transferring_DirectMode_CreatesJob(t *testing.T) {
+	// When TransferMode is "Direct", the transfer Job should have args pointing
+	// to the ms2m-agent URL (starting with "http"), not an OCI image ref.
+	migration := newMigration("mig-direct-xfer", migrationv1alpha1.PhaseTransferring)
+	migration.Spec.TransferMode = "Direct"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.CheckpointID = "/var/lib/kubelet/checkpoints/checkpoint-myapp-0.tar"
+	migration.Status.ContainerName = "app"
+	migration.Status.PhaseTimings = map[string]string{}
+
+	r, _, ctx := setupTest(migration)
+
+	_, err := reconcileOnce(r, ctx, "mig-direct-xfer", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "mig-direct-xfer-transfer", Namespace: "default"}, job); err != nil {
+		t.Fatalf("expected transfer job to be created: %v", err)
+	}
+
+	containers := job.Spec.Template.Spec.Containers
+	if len(containers) == 0 {
+		t.Fatal("expected at least one container in the job")
+	}
+
+	args := containers[0].Args
+	if len(args) != 3 {
+		t.Fatalf("expected 3 args, got %d: %v", len(args), args)
+	}
+	if args[0] != migration.Status.CheckpointID {
+		t.Errorf("expected args[0] (checkpoint path) %q, got %q", migration.Status.CheckpointID, args[0])
+	}
+	// Direct mode: second arg should be the agent URL (HTTP), not an OCI ref
+	expectedAgentURL := "http://ms2m-agent.ms2m-system.svc.cluster.local:9443/checkpoint"
+	if args[1] != expectedAgentURL {
+		t.Errorf("expected args[1] (agent URL) %q, got %q", expectedAgentURL, args[1])
+	}
+	if args[2] != "app" {
+		t.Errorf("expected args[2] (container name) %q, got %q", "app", args[2])
+	}
+}
+
+func TestReconcile_Restoring_DirectMode_UsesNeverPullPolicy(t *testing.T) {
+	// When TransferMode is "Direct", the shadow pod should have imagePullPolicy: Never
+	// and image tag starting with "localhost/checkpoint/".
+	migration := newMigration("mig-direct-restore", migrationv1alpha1.PhaseRestoring)
+	migration.Spec.TransferMode = "Direct"
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.ContainerName = "app"
+	migration.Status.CheckpointID = "/var/lib/kubelet/checkpoints/checkpoint-myapp-0.tar"
+	migration.Status.PhaseTimings = map[string]string{}
+
+	sourcePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myapp-0",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-1",
+			Containers: []corev1.Container{
+				{Name: "app", Image: "myapp:latest"},
+			},
+		},
+	}
+
+	r, _, ctx := setupTest(migration, sourcePod)
+
+	_, err := reconcileOnce(r, ctx, "mig-direct-restore", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	targetPod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "myapp-0-shadow", Namespace: "default"}, targetPod); err != nil {
+		t.Fatalf("expected shadow pod to be created: %v", err)
+	}
+
+	if len(targetPod.Spec.Containers) == 0 {
+		t.Fatal("expected at least one container in the target pod")
+	}
+
+	container := targetPod.Spec.Containers[0]
+
+	// Direct mode: image should be localhost/checkpoint/<containerName>:latest
+	expectedImage := "localhost/checkpoint/app:latest"
+	if container.Image != expectedImage {
+		t.Errorf("expected image %q, got %q", expectedImage, container.Image)
+	}
+
+	// Direct mode: pull policy should be Never (image is in local CRI-O store)
+	if container.ImagePullPolicy != corev1.PullNever {
+		t.Errorf("expected imagePullPolicy %q, got %q", corev1.PullNever, container.ImagePullPolicy)
+	}
+}
+
+func TestReconcile_Transferring_RegistryMode_Unchanged(t *testing.T) {
+	// When TransferMode is empty or "Registry", args should contain OCI image ref,
+	// not an HTTP URL. This verifies existing behavior is preserved.
+	for _, mode := range []string{"", "Registry"} {
+		name := fmt.Sprintf("mode_%s", mode)
+		if mode == "" {
+			name = "mode_empty"
+		}
+		t.Run(name, func(t *testing.T) {
+			migName := fmt.Sprintf("mig-reg-xfer-%s", name)
+			migration := newMigration(migName, migrationv1alpha1.PhaseTransferring)
+			migration.Spec.TransferMode = mode
+			migration.Status.SourceNode = "node-1"
+			migration.Status.CheckpointID = "/var/lib/kubelet/checkpoints/checkpoint-myapp-0.tar"
+			migration.Status.ContainerName = "app"
+			migration.Status.PhaseTimings = map[string]string{}
+
+			r, _, ctx := setupTest(migration)
+
+			_, err := reconcileOnce(r, ctx, migName, "default")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			job := &batchv1.Job{}
+			if err := r.Get(ctx, types.NamespacedName{Name: migName + "-transfer", Namespace: "default"}, job); err != nil {
+				t.Fatalf("expected transfer job to be created: %v", err)
+			}
+
+			containers := job.Spec.Template.Spec.Containers
+			if len(containers) == 0 {
+				t.Fatal("expected at least one container in the job")
+			}
+
+			args := containers[0].Args
+			if len(args) != 3 {
+				t.Fatalf("expected 3 args, got %d: %v", len(args), args)
+			}
+
+			// Registry mode: second arg should be the OCI image ref, not an HTTP URL
+			expectedImageRef := fmt.Sprintf("%s/%s:checkpoint", migration.Spec.CheckpointImageRepository, migration.Spec.SourcePod)
+			if args[1] != expectedImageRef {
+				t.Errorf("expected args[1] (image ref) %q, got %q", expectedImageRef, args[1])
+			}
+			if args[1][:4] == "http" {
+				t.Errorf("registry mode args should not start with http, got %q", args[1])
+			}
+		})
+	}
+}

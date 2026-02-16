@@ -270,8 +270,17 @@ func (r *StatefulMigrationReconciler) handleTransferring(ctx context.Context, m 
 			_ = r.Status().Patch(ctx, m, patch)
 		}
 
-		// Build the transfer Job spec
-		imageRef := fmt.Sprintf("%s/%s:checkpoint", m.Spec.CheckpointImageRepository, m.Spec.SourcePod)
+		// Build the transfer Job spec.
+		// Determine the transfer destination based on TransferMode.
+		var transferArgs []string
+		if m.Spec.TransferMode == "Direct" {
+			agentURL := fmt.Sprintf("http://ms2m-agent.ms2m-system.svc.cluster.local:9443/checkpoint")
+			transferArgs = []string{m.Status.CheckpointID, agentURL, m.Status.ContainerName}
+		} else {
+			imageRef := fmt.Sprintf("%s/%s:checkpoint", m.Spec.CheckpointImageRepository, m.Spec.SourcePod)
+			transferArgs = []string{m.Status.CheckpointID, imageRef, m.Status.ContainerName}
+		}
+
 		job := &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      jobName,
@@ -296,7 +305,7 @@ func (r *StatefulMigrationReconciler) handleTransferring(ctx context.Context, m 
 								Name:            "checkpoint-transfer",
 								Image:           "checkpoint-transfer:latest",
 								ImagePullPolicy: corev1.PullIfNotPresent,
-								Args:            []string{m.Status.CheckpointID, imageRef, m.Status.ContainerName},
+								Args:            transferArgs,
 								Env: []corev1.EnvVar{
 									{
 										Name:  "INSECURE_REGISTRY",
@@ -455,7 +464,15 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 	// Gather source pod information for building the target pod.
 	// For Sequential, the source was deleted — use data captured during Pending.
 	// For ShadowPod, the source is still alive — look it up directly.
-	checkpointImage := fmt.Sprintf("%s/%s:checkpoint", m.Spec.CheckpointImageRepository, m.Spec.SourcePod)
+	var checkpointImage string
+	var pullPolicy corev1.PullPolicy
+	if m.Spec.TransferMode == "Direct" {
+		checkpointImage = fmt.Sprintf("localhost/checkpoint/%s:latest", m.Status.ContainerName)
+		pullPolicy = corev1.PullNever
+	} else {
+		checkpointImage = fmt.Sprintf("%s/%s:checkpoint", m.Spec.CheckpointImageRepository, m.Spec.SourcePod)
+		pullPolicy = corev1.PullAlways
+	}
 	var sourceContainers []corev1.Container
 	var sourceLabels map[string]string
 	var sourcePodSpec *corev1.PodSpec
@@ -485,7 +502,7 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 			restored := corev1.Container{
 				Name:            c.Name,
 				Image:           checkpointImage,
-				ImagePullPolicy: corev1.PullAlways,
+				ImagePullPolicy: pullPolicy,
 				Ports:           c.Ports,
 			}
 			if c.Name != m.Status.ContainerName {
@@ -499,7 +516,7 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 			{
 				Name:            m.Status.ContainerName,
 				Image:           checkpointImage,
-				ImagePullPolicy: corev1.PullAlways,
+				ImagePullPolicy: pullPolicy,
 			},
 		}
 	}
