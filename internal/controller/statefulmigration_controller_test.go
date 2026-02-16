@@ -2927,4 +2927,95 @@ func TestReconcile_Pending_DetectsDeploymentStrategy(t *testing.T) {
 	}
 }
 
-// TestReconcile_Finalizing_ShadowPod_PatchesDeployment is in the next commit.
+func TestReconcile_Finalizing_ShadowPod_PatchesDeployment(t *testing.T) {
+	// When DeploymentName is set, Finalizing should patch the Deployment
+	// with nodeAffinity targeting the migration's TargetNode.
+	sourcePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myapp-0",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-1",
+			Containers: []corev1.Container{
+				{Name: "app", Image: "myapp:latest"},
+			},
+		},
+	}
+
+	replicas := int32(3)
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myapp-deploy",
+			Namespace: "default",
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "myapp"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "myapp"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "myapp:latest"},
+					},
+				},
+			},
+		},
+	}
+
+	migration := newMigration("mig-final-deploy", migrationv1alpha1.PhaseFinalizing)
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Status.TargetPod = "myapp-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.DeploymentName = "myapp-deploy"
+	migration.Status.PhaseTimings = map[string]string{}
+
+	r, mockBroker, ctx := setupTest(migration, sourcePod, deploy)
+	mockBroker.Connected = true
+
+	_, err := reconcileOnce(r, ctx, "mig-final-deploy", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-final-deploy", "default")
+	if got.Status.Phase != migrationv1alpha1.PhaseCompleted {
+		t.Errorf("expected phase %q, got %q", migrationv1alpha1.PhaseCompleted, got.Status.Phase)
+	}
+
+	// Verify the Deployment was patched with nodeAffinity
+	updatedDeploy := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "myapp-deploy", Namespace: "default"}, updatedDeploy); err != nil {
+		t.Fatalf("failed to get deployment: %v", err)
+	}
+
+	affinity := updatedDeploy.Spec.Template.Spec.Affinity
+	if affinity == nil || affinity.NodeAffinity == nil {
+		t.Fatal("expected Deployment to have nodeAffinity set")
+	}
+
+	required := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if required == nil || len(required.NodeSelectorTerms) == 0 {
+		t.Fatal("expected RequiredDuringSchedulingIgnoredDuringExecution with at least one term")
+	}
+
+	term := required.NodeSelectorTerms[0]
+	if len(term.MatchExpressions) == 0 {
+		t.Fatal("expected at least one MatchExpression")
+	}
+
+	expr := term.MatchExpressions[0]
+	if expr.Key != "kubernetes.io/hostname" {
+		t.Errorf("expected key %q, got %q", "kubernetes.io/hostname", expr.Key)
+	}
+	if expr.Operator != corev1.NodeSelectorOpIn {
+		t.Errorf("expected operator %q, got %q", corev1.NodeSelectorOpIn, expr.Operator)
+	}
+	if len(expr.Values) != 1 || expr.Values[0] != "node-2" {
+		t.Errorf("expected values [%q], got %v", "node-2", expr.Values)
+	}
+}
