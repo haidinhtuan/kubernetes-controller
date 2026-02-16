@@ -4,10 +4,12 @@ import (
 	"io"
 	"os"
 	"testing"
+
+	"github.com/haidinhtuan/kubernetes-controller/internal/checkpoint"
 )
 
 func TestBuildCheckpointImage_InvalidPath(t *testing.T) {
-	_, err := buildCheckpointImage("/nonexistent/path/checkpoint.tar", "test-container")
+	_, err := checkpoint.BuildCheckpointImage("/nonexistent/path/checkpoint.tar", "test-container")
 	if err == nil {
 		t.Fatal("expected error for nonexistent file, got nil")
 	}
@@ -27,7 +29,7 @@ func TestBuildCheckpointImage_ValidTar(t *testing.T) {
 	}
 	tmpFile.Close()
 
-	img, err := buildCheckpointImage(tmpFile.Name(), "my-container")
+	img, err := checkpoint.BuildCheckpointImage(tmpFile.Name(), "my-container")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -64,7 +66,7 @@ func TestBuildCheckpointImage_NoCompression(t *testing.T) {
 	}
 	tmpFile.Close()
 
-	img, err := buildCheckpointImage(tmpFile.Name(), "test")
+	img, err := checkpoint.BuildCheckpointImage(tmpFile.Name(), "test")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
