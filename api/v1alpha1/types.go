@@ -57,6 +57,11 @@ type StatefulMigrationSpec struct {
 	// "Sequential" deletes source before creating target (required for StatefulSets).
 	// If empty, auto-detected from ownerReferences.
 	MigrationStrategy string `json:"migrationStrategy,omitempty"`
+
+	// TransferMode controls how the checkpoint is moved to the target node.
+	// "Registry" (default): build OCI image, push to registry, target pulls.
+	// "Direct": POST checkpoint tar to ms2m-agent on target node via HTTP.
+	TransferMode string `json:"transferMode,omitempty"`
 }
 
 // StatefulMigrationStatus defines the observed state of StatefulMigration
@@ -87,6 +92,9 @@ type StatefulMigrationStatus struct {
 
 	// StatefulSetName is the name of the owning StatefulSet (for Sequential strategy scale-down/up)
 	StatefulSetName string `json:"statefulSetName,omitempty"`
+
+	// DeploymentName is the name of the owning Deployment (for ShadowPod Finalizing)
+	DeploymentName string `json:"deploymentName,omitempty"`
 
 	// OriginalReplicas is the StatefulSet's replica count before scale-down
 	OriginalReplicas int32 `json:"originalReplicas,omitempty"`

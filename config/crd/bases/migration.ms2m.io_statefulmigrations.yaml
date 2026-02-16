@@ -79,6 +79,12 @@ spec:
               targetNode:
                 description: TargetNode is the optional node selector for the target
                 type: string
+              transferMode:
+                description: 'TransferMode controls how the checkpoint is moved to the
+                  target node. "Registry" (default): build OCI image, push to registry,
+                  target pulls. "Direct": POST checkpoint tar to ms2m-agent on target
+                  node via HTTP.'
+                type: string
             type: object
           status:
             description: StatefulMigrationStatus defines the observed state of StatefulMigration
@@ -164,6 +170,9 @@ spec:
                 description: SourcePodLabels stores the source pod labels for copying
                   to the target pod
                 type: object
+              deploymentName:
+                description: DeploymentName is the name of the owning Deployment
+                type: string
               statefulSetName:
                 description: StatefulSetName is the name of the owning StatefulSet
                 type: string
