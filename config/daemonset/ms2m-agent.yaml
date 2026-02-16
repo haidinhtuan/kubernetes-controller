@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ms2m-agent
+  namespace: ms2m-system
+spec:
+  selector:
+    matchLabels:
+      app: ms2m-agent
+  template:
+    metadata:
+      labels:
+        app: ms2m-agent
+    spec:
+      hostPID: true
+      containers:
+      - name: agent
+        image: ms2m-agent:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 9443
+          name: http
+        env:
+        - name: STORAGE_DIR
+          value: "/var/lib/ms2m/incoming"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: checkpoints
+          mountPath: /var/lib/kubelet/checkpoints
+          readOnly: true
+        - name: ms2m-storage
+          mountPath: /var/lib/ms2m
+        - name: containers-storage
+          mountPath: /var/lib/containers/storage
+      volumes:
+      - name: checkpoints
+        hostPath:
+          path: /var/lib/kubelet/checkpoints
+      - name: ms2m-storage
+        hostPath:
+          path: /var/lib/ms2m
+      - name: containers-storage
+        hostPath:
+          path: /var/lib/containers/storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms2m-agent
+  namespace: ms2m-system
+spec:
+  selector:
+    app: ms2m-agent
+  ports:
+  - port: 9443
+    targetPort: 9443
+    name: http
