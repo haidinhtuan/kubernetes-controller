@@ -13,13 +13,11 @@ MSG_RATES=(1 4 7 10 13 16 19)
 REPETITIONS=10
 RESULTS_FILE="eval/results/migration-metrics-${CONFIGURATION}-$(date +%Y%m%d-%H%M%S).csv"
 NAMESPACE="${NAMESPACE:-default}"
-TARGET_NODE="${TARGET_NODE:-}"  # must be set
 CHECKPOINT_REPO="${CHECKPOINT_REPO:-registry.registry.svc.cluster.local:5000/checkpoints}"
 
-if [[ -z "$TARGET_NODE" ]]; then
-    echo "ERROR: TARGET_NODE must be set"
-    exit 1
-fi
+# Worker nodes — target is dynamically chosen to be opposite of source
+WORKER_1="${WORKER_1:-worker-1}"
+WORKER_2="${WORKER_2:-worker-2}"
 
 mkdir -p "$(dirname "$RESULTS_FILE")"
 
@@ -65,6 +63,15 @@ for rate in "${MSG_RATES[@]}"; do
             echo "    Source pod: $SOURCE_POD"
         fi
 
+        # Dynamically determine target node (must differ from source node)
+        SOURCE_NODE=$(kubectl get pod "$SOURCE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}')
+        if [[ "$SOURCE_NODE" == "$WORKER_1" ]]; then
+            DYNAMIC_TARGET="$WORKER_2"
+        else
+            DYNAMIC_TARGET="$WORKER_1"
+        fi
+        echo "    Source: $SOURCE_POD on $SOURCE_NODE -> Target: $DYNAMIC_TARGET"
+
         # Build optional CR fields based on configuration
         if [[ "$CONFIGURATION" == "deployment-direct" ]]; then
             TRANSFER_MODE_FIELD="  transferMode: Direct"
@@ -86,7 +93,7 @@ metadata:
   name: ${MIGRATION_NAME}
 spec:
   sourcePod: ${SOURCE_POD}
-  targetNode: ${TARGET_NODE}
+  targetNode: ${DYNAMIC_TARGET}
   checkpointImageRepository: ${CHECKPOINT_REPO}
   replayCutoffSeconds: 120
 ${STRATEGY_FIELD}
@@ -118,13 +125,12 @@ YAML
         REPLAY_T=$(echo "$TIMINGS" | jq -r '.status.phaseTimings.Replaying // "N/A"')
         FINALIZE_T=$(echo "$TIMINGS" | jq -r '.status.phaseTimings.Finalizing // "N/A"')
 
-        START_TIME=$(echo "$TIMINGS" | jq -r '.status.startTime // ""')
-        if [[ -n "$START_TIME" && "$PHASE" == "Completed" ]]; then
-            # Calculate total time from start to last condition update
+        # Calculate total time by summing phase durations (more robust than timestamp math)
+        if [[ "$PHASE" == "Completed" ]]; then
             TOTAL_T=$(echo "$TIMINGS" | jq -r '
-                (.status.startTime | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $start |
-                (.status.conditions[-1].lastTransitionTime | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $end |
-                ($end - $start) | tostring + "s"')
+                [.status.phaseTimings | to_entries[] | .value |
+                 if test("^[0-9.]+s$") then rtrimstr("s") | tonumber else 0 end] |
+                add | tostring + "s"' 2>/dev/null || echo "N/A")
         else
             TOTAL_T="N/A"
         fi
@@ -136,8 +142,26 @@ YAML
 
         # Wait for consumer to be ready for next run
         if [[ "$CONFIGURATION" == statefulset-* ]]; then
-            # StatefulSet: controller handles scale-down/up, wait for pod to return
-            sleep 15
+            # StatefulSet: wait for old pod termination, then recreation and readiness
+            echo -n "    Waiting for consumer-0 readiness..."
+            # Wait for old pod to fully terminate (owned by deleted CR)
+            for i in $(seq 1 60); do
+                POD_STATUS=$(kubectl get pod consumer-0 -n "$NAMESPACE" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null)
+                # Break when pod either has no deletionTimestamp or doesn't exist at all
+                if [[ -z "$POD_STATUS" ]]; then break; fi
+                sleep 2
+                echo -n "."
+            done
+            # Wait for StatefulSet to recreate the pod (may take a few seconds after deletion)
+            for i in $(seq 1 30); do
+                if kubectl get pod consumer-0 -n "$NAMESPACE" &>/dev/null; then break; fi
+                sleep 2
+                echo -n "+"
+            done
+            # Wait for the pod to become Ready
+            kubectl wait --for=condition=Ready pod/consumer-0 -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
+            sleep 5
+            echo " ready"
         else
             # Deployment: source pod is deleted during Finalizing, Deployment
             # controller recreates a new pod. Wait for it to be ready.

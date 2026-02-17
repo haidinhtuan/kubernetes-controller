@@ -76,13 +76,12 @@ YAML
         REPLAY_T=$(echo "$TIMINGS" | jq -r '.status.phaseTimings.Replaying // "N/A"')
         FINALIZE_T=$(echo "$TIMINGS" | jq -r '.status.phaseTimings.Finalizing // "N/A"')
 
-        START_TIME=$(echo "$TIMINGS" | jq -r '.status.startTime // ""')
-        if [[ -n "$START_TIME" && "$PHASE" == "Completed" ]]; then
-            # Calculate total time from start to last condition update
+        # Calculate total time by summing phase durations
+        if [[ "$PHASE" == "Completed" ]]; then
             TOTAL_T=$(echo "$TIMINGS" | jq -r '
-                (.status.startTime | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $start |
-                (.status.conditions[-1].lastTransitionTime | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $end |
-                ($end - $start) | tostring + "s"')
+                [.status.phaseTimings | to_entries[] | .value |
+                 if test("^[0-9.]+s$") then rtrimstr("s") | tonumber else 0 end] |
+                add | tostring + "s"' 2>/dev/null || echo "N/A")
         else
             TOTAL_T="N/A"
         fi

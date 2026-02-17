@@ -13,10 +13,11 @@ set -euo pipefail
 # then cleans up before switching.
 #
 # Usage:
-#   TARGET_NODE=worker-2 bash eval/scripts/run_all_evaluations.sh
+#   bash eval/scripts/run_all_evaluations.sh
 #
 # Environment:
-#   TARGET_NODE       - Required. Target node for migration.
+#   WORKER_1          - First worker node (default: worker-1)
+#   WORKER_2          - Second worker node (default: worker-2)
 #   NAMESPACE         - Namespace for workloads (default: default)
 #   MSG_RATES         - Space-separated rates (default: "1 4 7 10 13 16 19")
 #   REPETITIONS       - Runs per rate (default: 10)
@@ -25,12 +26,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NAMESPACE="${NAMESPACE:-default}"
-TARGET_NODE="${TARGET_NODE:-}"
-
-if [[ -z "$TARGET_NODE" ]]; then
-    echo "ERROR: TARGET_NODE must be set"
-    exit 1
-fi
+WORKER_1="${WORKER_1:-worker-1}"
+WORKER_2="${WORKER_2:-worker-2}"
 
 CONSUMER_SS="$PROJECT_ROOT/eval/workloads/consumer.yaml"
 CONSUMER_DEPLOY="$PROJECT_ROOT/eval/workloads/consumer-deployment.yaml"
@@ -40,7 +37,7 @@ CONFIGURATIONS=("statefulset-sequential" "deployment-registry" "deployment-direc
 echo "============================================="
 echo "  MS2M Full Evaluation Suite"
 echo "============================================="
-echo "Target node: $TARGET_NODE"
+echo "Workers:     $WORKER_1, $WORKER_2"
 echo "Namespace:   $NAMESPACE"
 echo "Configs:     ${CONFIGURATIONS[*]}"
 echo ""
@@ -74,7 +71,8 @@ for config in "${CONFIGURATIONS[@]}"; do
     # Run the evaluation
     CONFIGURATION="$config" \
     NAMESPACE="$NAMESPACE" \
-    TARGET_NODE="$TARGET_NODE" \
+    WORKER_1="$WORKER_1" \
+    WORKER_2="$WORKER_2" \
         bash "$SCRIPT_DIR/run_optimized_evaluation.sh"
 
     # Cleanup consumer workload before switching
