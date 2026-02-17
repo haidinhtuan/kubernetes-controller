@@ -91,8 +91,22 @@ YAML
         # Cleanup: delete the migration CR
         kubectl delete statefulmigration "$MIGRATION_NAME" -n "$NAMESPACE" --ignore-not-found
 
-        # Wait for consumer to be re-created and ready
-        sleep 15
+        # Wait for consumer-0 to be re-created and ready
+        echo -n "    Waiting for consumer-0 readiness..."
+        for i in $(seq 1 60); do
+            POD_STATUS=$(kubectl get pod consumer-0 -n "$NAMESPACE" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)
+            if [[ -z "$POD_STATUS" ]]; then break; fi
+            sleep 2
+            echo -n "."
+        done
+        for i in $(seq 1 30); do
+            if kubectl get pod consumer-0 -n "$NAMESPACE" &>/dev/null; then break; fi
+            sleep 2
+            echo -n "+"
+        done
+        kubectl wait --for=condition=Ready pod/consumer-0 -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
+        sleep 5
+        echo " ready"
     done
 done
 

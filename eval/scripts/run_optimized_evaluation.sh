@@ -146,7 +146,7 @@ YAML
             echo -n "    Waiting for consumer-0 readiness..."
             # Wait for old pod to fully terminate (owned by deleted CR)
             for i in $(seq 1 60); do
-                POD_STATUS=$(kubectl get pod consumer-0 -n "$NAMESPACE" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null)
+                POD_STATUS=$(kubectl get pod consumer-0 -n "$NAMESPACE" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)
                 # Break when pod either has no deletionTimestamp or doesn't exist at all
                 if [[ -z "$POD_STATUS" ]]; then break; fi
                 sleep 2
@@ -165,7 +165,7 @@ YAML
         else
             # Deployment: source pod is deleted during Finalizing, Deployment
             # controller recreates a new pod. Wait for it to be ready.
-            kubectl rollout status deployment/consumer -n "$NAMESPACE" --timeout=120s
+            kubectl rollout status deployment/consumer -n "$NAMESPACE" --timeout=120s || true
             sleep 10
         fi
     done
