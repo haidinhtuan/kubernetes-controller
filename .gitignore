@@ -50,9 +50,9 @@ eval/infra/
 # Evaluation results
 eval/results/
 
-# Internal planning docs
+# Internal docs
 PLAN.md
-docs/plans/
+docs/
 
 # Claude Code
 CLAUDE.md
