@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Evaluation parameters (matching dissertation methodology)
-MSG_RATES=(1 4 7 10 13 16 19)
+MSG_RATES=(10 20 40 60 80 100 120)
 REPETITIONS=10
 RESULTS_FILE="eval/results/migration-metrics-$(date +%Y%m%d-%H%M%S).csv"
 NAMESPACE="${NAMESPACE:-default}"
@@ -80,7 +80,7 @@ YAML
         if [[ "$PHASE" == "Completed" ]]; then
             TOTAL_T=$(echo "$TIMINGS" | jq -r '
                 [.status.phaseTimings | to_entries[] | .value |
-                 if test("^[0-9.]+s$") then rtrimstr("s") | tonumber else 0 end] |
+                 if test("^[0-9.]+ms$") then rtrimstr("ms") | tonumber / 1000 elif test("^[0-9]+m") then (split("m") | (.[0] | tonumber) * 60 + (.[1] | rtrimstr("s") | tonumber)) elif test("^[0-9.]+s$") then rtrimstr("s") | tonumber else 0 end] |
                 add | tostring + "s"' 2>/dev/null || echo "N/A")
         else
             TOTAL_T="N/A"

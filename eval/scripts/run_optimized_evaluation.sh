@@ -9,7 +9,7 @@ CONFIGURATION="${CONFIGURATION:-deployment-registry}"
 #   "deployment-direct"      — Deployment + ShadowPod + Direct transfer
 
 # Evaluation parameters (matching dissertation methodology)
-MSG_RATES=(1 4 7 10 13 16 19)
+MSG_RATES=(10 20 40 60 80 100 120)
 REPETITIONS=10
 RESULTS_FILE="eval/results/migration-metrics-${CONFIGURATION}-$(date +%Y%m%d-%H%M%S).csv"
 NAMESPACE="${NAMESPACE:-default}"
@@ -39,9 +39,12 @@ for rate in "${MSG_RATES[@]}"; do
     # Update producer rate
     kubectl set env deployment/message-producer MSG_RATE="$rate" -n "$NAMESPACE"
 
-    # Wait for producer to stabilize
+    # Wait for producer to stabilize at new rate
     kubectl rollout status deployment/message-producer -n "$NAMESPACE" --timeout=60s
-    sleep 10  # let queue reach steady state
+    sleep 20  # let queue reach steady state
+
+    # Find RabbitMQ pod (once per rate)
+    RMQ_POD=$(kubectl get pods -n rabbitmq -o jsonpath='{.items[0].metadata.name}')
 
     for rep in $(seq 1 $REPETITIONS); do
         run_counter=$((run_counter + 1))
@@ -84,6 +87,11 @@ for rate in "${MSG_RATES[@]}"; do
         else
             STRATEGY_FIELD="  migrationStrategy: ShadowPod"
         fi
+
+        # Purge queues to prevent message accumulation between runs
+        kubectl exec -n rabbitmq "$RMQ_POD" -- rabbitmqctl purge_queue app.events 2>/dev/null || true
+        kubectl exec -n rabbitmq "$RMQ_POD" -- rabbitmqctl delete_queue app.events.ms2m-replay 2>/dev/null || true
+        sleep 3  # let consumer settle after purge
 
         # Create StatefulMigration CR
         cat <<YAML | kubectl apply -n "$NAMESPACE" -f -
@@ -129,7 +137,7 @@ YAML
         if [[ "$PHASE" == "Completed" ]]; then
             TOTAL_T=$(echo "$TIMINGS" | jq -r '
                 [.status.phaseTimings | to_entries[] | .value |
-                 if test("^[0-9.]+s$") then rtrimstr("s") | tonumber else 0 end] |
+                 if test("^[0-9.]+ms$") then rtrimstr("ms") | tonumber / 1000 elif test("^[0-9]+m") then (split("m") | (.[0] | tonumber) * 60 + (.[1] | rtrimstr("s") | tonumber)) elif test("^[0-9.]+s$") then rtrimstr("s") | tonumber else 0 end] |
                 add | tostring + "s"' 2>/dev/null || echo "N/A")
         else
             TOTAL_T="N/A"
@@ -164,9 +172,25 @@ YAML
             echo " ready"
         else
             # Deployment: source pod is deleted during Finalizing, Deployment
-            # controller recreates a new pod. Wait for it to be ready.
+            # controller recreates a new pod. Wait for all terminating pods
+            # (source + shadow) to be gone, then for the new pod to be ready.
+            echo -n "    Waiting for cleanup..."
+            for i in $(seq 1 60); do
+                TERMINATING=$(kubectl get pods -n "$NAMESPACE" -l app=consumer \
+                    --field-selector=status.phase!=Running -o name 2>/dev/null | wc -l)
+                SHADOW=$(kubectl get pod -n "$NAMESPACE" -l "migration.ms2m.io/role=target" \
+                    -o name 2>/dev/null | wc -l)
+                if [[ "$TERMINATING" -eq 0 && "$SHADOW" -eq 0 ]]; then break; fi
+                sleep 2
+                echo -n "."
+            done
+            echo ""
             kubectl rollout status deployment/consumer -n "$NAMESPACE" --timeout=120s || true
-            sleep 10
+            sleep 5
+            # Verify exactly 1 Running consumer pod before next run
+            READY_PODS=$(kubectl get pods -n "$NAMESPACE" -l app=consumer \
+                --field-selector=status.phase=Running -o name 2>/dev/null | wc -l)
+            echo "    Consumer pods ready: $READY_PODS"
         fi
     done
 done
