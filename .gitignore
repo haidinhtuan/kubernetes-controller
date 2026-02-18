@@ -51,6 +51,7 @@ eval/infra/
 eval/results/
 
 # Internal planning docs
+PLAN.md
 docs/plans/
 
 # Claude Code
