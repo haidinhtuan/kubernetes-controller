@@ -6,19 +6,42 @@
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.30+-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Kubernetes controller that performs live migration of stateful microservices between cluster nodes. It combines CRIU-based container checkpointing with message queue replay to preserve both in-memory execution state and in-flight message consistency -- achieving zero-downtime, zero-message-loss pod migration.
+A Kubernetes operator that performs live migration of stateful microservices between cluster nodes. It combines CRIU-based container checkpointing with message queue replay to preserve both in-memory execution state and in-flight message consistency -- achieving zero-downtime, zero-message-loss pod migration.
 
-## Overview
+This operator extends and advances the MS2M framework described in [Dinh-Tuan & Beierle (2022)](https://ieeexplore.ieee.org/abstract/document/9766576) and [Dinh-Tuan & Jiang (2025)](https://ieeexplore.ieee.org/abstract/document/10942720) with a production-grade declarative architecture and several new mechanisms not present in either publication.
+
+## Background
 
 Standard Kubernetes mechanisms (e.g., pod eviction, node drain, StatefulSet rescheduling) handle pod mobility through a destructive delete-and-recreate cycle. While this works for stateless workloads, it causes loss of in-memory state, dropped connections, and potential data inconsistency for stateful microservices that maintain runtime caches, session data, or message processing state.
 
-MS2M addresses this gap by introducing a **preservative migration** model. The controller checkpoints a running container's full process state via CRIU (Checkpoint/Restore In Userspace), transfers the checkpoint as an OCI image to a target node, and restores the container with its complete memory, file descriptors, and execution context intact. Concurrently, a fan-out message queue ensures that messages published during the migration window are duplicated to a secondary replay queue, which the restored container drains before assuming primary duties.
+MS2M addresses this gap with a **preservative migration** model: checkpoint a running container's full process state via CRIU, transfer the checkpoint to a target node, restore the container with its complete memory and execution context intact, and replay any messages published during the migration window through a secondary queue.
 
-This project implements the MS2M framework as described in [Dinh-Tuan & Jiang (2025)](https://ieeexplore.ieee.org/abstract/document/10942720), building on the original [MS2M concept (2022)](https://ieeexplore.ieee.org/abstract/document/9766576). The controller is built on the [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) framework and defines a single Custom Resource Definition (`StatefulMigration`) that drives a phase-based state machine through the entire migration lifecycle.
+### Prior Work
+
+The original MS2M concept ([CIoT 2022](https://ieeexplore.ieee.org/abstract/document/9766576)) demonstrated this approach on Podman with raw CRIU and direct host-to-host transfer (rsync/SSH), orchestrated by an imperative Python script. It achieved a 19.92% downtime reduction compared to stop-and-copy migration.
+
+The Kubernetes integration ([ICIN 2025](https://ieeexplore.ieee.org/abstract/document/10942720)) adapted the framework to use Forensic Container Checkpointing (FCC) via the kubelet API, introduced a Sequential migration strategy for StatefulSet-managed pods, and added a threshold-based cutoff mechanism for bounded replay time. It was still orchestrated by an imperative Python Migration Manager and demonstrated up to 96.99% downtime reduction versus cold migration.
+
+### What This Operator Adds
+
+This repository advances both publications with the following new contributions:
+
+| Advancement | Description |
+|:------------|:------------|
+| **Declarative Kubernetes operator** | Replaces the imperative Python Migration Manager with a controller-runtime reconciler. Migrations are expressed as `StatefulMigration` custom resources; a reconciliation loop drives the state machine through the Kubernetes control plane. |
+| **ShadowPod strategy for StatefulSets** | Both papers only support Sequential (scale-to-zero) for StatefulSet pods. This operator adds a ShadowPod path where source and target coexist during replay, then the StatefulSet is scaled down by one replica in finalization -- avoiding the downtime gap where the source is killed before the target exists. |
+| **Direct node-to-node transfer mode** | Both papers describe only registry-based checkpoint transfer. This operator adds a second path: a DaemonSet agent (`ms2m-agent`) on each node receives checkpoint tarballs via HTTP and loads them directly into the local CRI-O, bypassing the container registry entirely. |
+| **Deployment-aware finalization** | Neither paper addresses Deployment-managed pods. The operator patches the owning Deployment's pod template with `nodeAffinity` targeting the destination node, so replacement pods are scheduled correctly after the source is deleted. |
+| **Automatic strategy detection** | The operator inspects the source pod's `ownerReferences` to auto-select Sequential (StatefulSet) or ShadowPod (Deployment/standalone) when no strategy is specified. |
+| **Phase chaining** | When a phase completes synchronously, the reconciler re-fetches the resource and immediately enters the next phase handler within the same API call, avoiding work queue round-trips. |
+| **Exponential polling backoff** | Transferring, Restoring, and Replaying use adaptive requeue intervals (1s -> 2s -> 5s based on elapsed time) to reduce API server load. The papers use fixed polling intervals. |
+| **Uncompressed OCI checkpoint layers** | The checkpoint image builder deliberately skips gzip compression. On cluster-local networks, CPU cost of compression outweighs bandwidth savings. |
+| **Source pod metadata caching** | For Sequential strategy, the source pod is deleted before the target is created. The operator caches source pod labels and container specs in the CRD status during Pending so they remain available during Restoring. |
+| **CRIU-aware hostname resolution** | After checkpoint/restore, `gethostname()` returns the UTS hostname from the checkpointed process (the source pod name). The consumer reads `/etc/hostname` instead (bind-mounted by the container runtime), which reflects the actual pod name for correct control queue routing. |
 
 ## Architecture
 
-The system consists of four cooperating actors:
+The system consists of five cooperating components:
 
 ```
                     Kubernetes API Server
@@ -34,12 +57,19 @@ The system consists of four cooperating actors:
                | Kubelet   |     | Kubelet   |
                | (Node A)  |     | (Node B)  |
                +-----------+     +-----------+
+                                      ^
+                                      |
+                                 +-----------+
+                                 | ms2m-agent|  (Direct transfer mode)
+                                 | DaemonSet |
+                                 +-----------+
 ```
 
-- **Controller** -- Runs as a Deployment in the cluster. Watches `StatefulMigration` custom resources and orchestrates the state machine through each migration phase.
+- **Controller** -- Runs as a Deployment. Watches `StatefulMigration` custom resources and drives the phase-based state machine through each migration stage via reconciliation.
 - **Source Kubelet** -- Executes the CRIU checkpoint via the kubelet checkpoint API (`POST /checkpoint/{namespace}/{pod}/{container}`), proxied through the API server.
-- **Transfer Job** -- An ephemeral Kubernetes Job scheduled on the source node. It packages the checkpoint tarball as a single-layer OCI image using [go-containerregistry](https://github.com/google/go-containerregistry) and pushes it to the container registry.
-- **Target Kubelet** -- Pulls the checkpoint image from the registry and restores the container with its full in-memory state on the target node.
+- **Transfer Job** -- An ephemeral Kubernetes Job scheduled on the source node. Packages the checkpoint tarball as a single-layer OCI image using [go-containerregistry](https://github.com/google/go-containerregistry). In Registry mode, pushes to a container registry. In Direct mode, POSTs to the ms2m-agent on the target node.
+- **ms2m-agent** -- A DaemonSet running on each node (Direct transfer mode only). Receives checkpoint tarballs via HTTP, builds the OCI image locally, and loads it into CRI-O via `skopeo copy`, bypassing the registry.
+- **Target Kubelet** -- Pulls (or loads) the checkpoint image and restores the container with its full in-memory state on the target node.
 
 ## Migration Phases
 
@@ -67,22 +97,122 @@ stateDiagram-v2
 
 | Phase | Description |
 |:------|:------------|
-| **Pending** | Validates the migration spec, resolves the source pod's node, container name, and owner references. Auto-detects the migration strategy if not specified. |
-| **Checkpointing** | Creates a secondary replay queue with fan-out binding on the message broker, then triggers a CRIU checkpoint via the kubelet API. |
-| **Transferring** | Launches a Transfer Job on the source node to package the checkpoint tarball as an OCI image and push it to the configured container registry. |
-| **Restoring** | Creates a target pod on the destination node using the checkpoint image. For Sequential migrations, scales down the owning StatefulSet first. |
-| **Replaying** | Sends a `START_REPLAY` control message to the target pod. Monitors the replay queue depth and proceeds to finalization when the queue is drained or the cutoff threshold is exceeded. |
-| **Finalizing** | Sends `END_REPLAY`, tears down the secondary queue, removes the source workload, and marks the migration as complete. For Sequential, the StatefulSet is scaled back to its original replica count. For ShadowPod with a Deployment, the source pod is deleted directly. For ShadowPod with a StatefulSet, the StatefulSet is scaled down by one replica. |
+| **Pending** | Validates the migration spec. Resolves the source pod's node, container name, and owner references (StatefulSet, Deployment, or standalone). Caches source pod labels and container specs in the CRD status for later use. Auto-detects the migration strategy from `ownerReferences` if not specified. |
+| **Checkpointing** | Connects to the message broker. Declares a fanout exchange and creates a secondary replay queue bound alongside the primary queue, so all new messages are duplicated. Triggers a CRIU checkpoint via the kubelet API. |
+| **Transferring** | Launches a Transfer Job on the source node. In Registry mode, the job builds an uncompressed OCI image from the checkpoint tarball and pushes it to the configured registry. In Direct mode, it streams the tarball to the ms2m-agent on the target node. Polls job completion with exponential backoff. |
+| **Restoring** | Creates a target pod on the destination node using the checkpoint image. For Sequential strategy, scales down the owning StatefulSet first and waits for the source pod to terminate. For ShadowPod, the source remains running. Waits for the target pod to reach Running state. |
+| **Replaying** | Sends a `START_REPLAY` control message to the target pod via its RabbitMQ control queue. Monitors the replay queue depth with exponential backoff polling. Proceeds to finalization when the queue is drained to zero or the `replayCutoffSeconds` threshold is exceeded. |
+| **Finalizing** | Sends `END_REPLAY` and tears down the secondary queue. Cleanup depends on strategy and workload type: Sequential scales the StatefulSet back to its original replica count. ShadowPod with a Deployment deletes the source pod and patches the Deployment with `nodeAffinity` for the target node. ShadowPod with a StatefulSet scales down by one replica. Closes the broker connection and marks the migration as Completed. |
 
-## Key Features
+## Migration Strategies
 
-- **Full process state preservation** -- CRIU captures memory, registers, file descriptors, and environment variables; the restored container resumes exactly where it left off.
-- **Zero message loss** -- Fan-out duplication to a secondary queue ensures every message published during migration is replayed by the target pod.
-- **Two migration strategies** -- ShadowPod (source and target coexist during replay, works with both Deployments and StatefulSets) and Sequential (scales StatefulSet down before creating the target pod).
-- **Automatic strategy detection** -- Inspects the source pod's `ownerReferences` to select the appropriate strategy when not explicitly configured.
-- **Phase timing instrumentation** -- Records the duration of each phase in `status.phaseTimings` for performance analysis and evaluation.
-- **Exponential polling backoff** -- Adaptive requeue intervals for long-running phases (Transferring, Restoring, Replaying) to reduce API server load.
-- **Phase chaining** -- Synchronously completed phases are chained within a single reconcile call to minimize work queue round-trips.
+### ShadowPod
+
+The controller creates a shadow pod (e.g., `worker-0-shadow`) on the target node while the source pod is still running. Both pods coexist during the replay phase, ensuring the target can catch up on messages before traffic is switched. This minimizes downtime since the source continues processing while the target replays missed messages.
+
+During finalization, cleanup depends on the workload type:
+
+- **Deployment-managed pods**: the source pod is deleted directly. The controller patches the owning Deployment's pod template with `nodeAffinity` targeting the destination node, ensuring replacement pods are scheduled on the correct node.
+- **StatefulSet-managed pods** *(new in this operator)*: the StatefulSet is scaled down by one replica instead of deleting the pod directly, since direct deletion would cause the StatefulSet controller to recreate it. The shadow pod (carrying the app label) continues serving traffic via the Service.
+- **Standalone pods**: the source pod is deleted directly.
+
+### Sequential
+
+Designed for StatefulSet pods with strict identity requirements where `worker-0` cannot exist as two pods simultaneously. The Sequential strategy scales the owning StatefulSet to zero replicas, waits for the StatefulSet controller to delete the source pod, then creates the target pod with the same identity using the checkpoint image. After migration completes, the StatefulSet is scaled back to its original replica count.
+
+This strategy incurs higher downtime than ShadowPod since the source is stopped before the target is created.
+
+### Auto-Detection
+
+When `migrationStrategy` is omitted, the controller inspects the source pod's `ownerReferences`:
+- If owned by a StatefulSet, defaults to **Sequential**.
+- Otherwise, defaults to **ShadowPod**.
+
+To use the ShadowPod strategy with a StatefulSet-managed pod, set `migrationStrategy: ShadowPod` explicitly in the CR spec.
+
+## Checkpoint Transfer Modes
+
+### Registry (default)
+
+The Transfer Job packages the checkpoint tarball as a single-layer OCI image and pushes it to the configured container registry. The target node's kubelet pulls the image when creating the restored pod. This mode requires a container registry accessible from all nodes.
+
+The OCI image is built without gzip compression: on cluster-local networks, the CPU cost of compression outweighs bandwidth savings, and the uncompressed layer can be pulled faster.
+
+### Direct
+
+The Transfer Job streams the checkpoint tarball directly to the `ms2m-agent` DaemonSet on the target node via HTTP POST. The agent builds the OCI image locally and loads it into CRI-O using `skopeo copy`, bypassing the registry entirely. This mode eliminates the registry as a dependency and avoids the push-pull round-trip.
+
+To use Direct mode, deploy the ms2m-agent DaemonSet and set `transferMode: Direct` in the CR spec:
+
+```bash
+kubectl apply -f config/daemonset/ms2m-agent.yaml
+```
+
+## How It Works
+
+### Message Queue Replay
+
+The replay mechanism ensures zero message loss during migration:
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant E as Fanout Exchange
+    participant PQ as Primary Queue
+    participant RQ as Replay Queue
+    participant S as Source Pod
+    participant T as Target Pod
+    participant C as Controller
+
+    Note over C: Checkpointing Phase
+    C->>E: Create fanout exchange
+    C->>RQ: Create replay queue
+    C->>E: Bind PQ + RQ to exchange
+    P->>E: Publish messages
+    E->>PQ: Duplicate
+    E->>RQ: Duplicate
+    C->>S: Trigger CRIU checkpoint
+
+    Note over C: Transferring + Restoring
+    C->>T: Create target pod from checkpoint image
+
+    Note over C: Replaying Phase
+    C->>T: Send START_REPLAY (via control queue)
+    T->>RQ: Consume replay messages
+    C->>RQ: Poll queue depth
+    Note over C: Queue drained or cutoff reached
+
+    Note over C: Finalizing Phase
+    C->>T: Send END_REPLAY
+    T->>PQ: Switch to primary queue
+    C->>RQ: Delete replay queue
+    C->>S: Delete source pod
+```
+
+1. **Fan-out setup** -- Before checkpointing, the controller declares a fanout exchange and binds both the primary and a secondary replay queue. All new messages are duplicated to both queues.
+2. **Checkpoint** -- CRIU freezes the source container's process state. The container has processed all messages up to this point.
+3. **Restore** -- The target pod starts from the checkpoint image, resuming with the exact process state at checkpoint time.
+4. **Replay** -- The target pod consumes and processes messages from the replay queue (which contains every message published since the fan-out was established).
+5. **Cutover** -- Once the replay queue is drained (or the cutoff threshold is reached), the target pod switches to the primary queue and the source pod is removed.
+
+### Consumer-Side Contract
+
+The target application must implement a control message listener on the queue `ms2m.control.<pod-name>` that handles two message types:
+
+| Control Message | Action |
+|:----------------|:-------|
+| `START_REPLAY` | Switch consumption from the primary queue to the replay queue specified in `payload.queue` |
+| `END_REPLAY` | Switch back to consuming from the primary queue |
+
+After CRIU restore, the consumer must resolve its hostname from `/etc/hostname` (bind-mounted by the container runtime) rather than `gethostname()`, which returns the checkpointed UTS hostname of the source pod. This ensures the control queue name matches the actual pod name so the controller can route `START_REPLAY`/`END_REPLAY` correctly.
+
+### Reconciler Optimizations
+
+The reconciler implements two optimizations beyond standard controller-runtime patterns:
+
+- **Phase chaining**: When a phase handler completes synchronously (returns an immediate requeue), the reconciler re-fetches the resource and enters the next handler within the same API call. This eliminates work queue round-trips for phases that complete instantly (e.g., Pending -> Checkpointing when validation passes on the first attempt).
+
+- **Exponential polling backoff**: Long-running async phases (Transferring, Restoring, Replaying) use adaptive requeue intervals that increase from 1s to 2s to 5s based on elapsed wall-clock time. This reduces API server load during operations that typically take tens of seconds.
 
 ## Prerequisites
 
@@ -91,7 +221,7 @@ stateDiagram-v2
 | **Kubernetes** | v1.30+ with the `ContainerCheckpoint` feature gate enabled |
 | **Container Runtime** | CRI-O or containerd with CRIU checkpoint/restore support |
 | **CRIU** | Installed on all cluster nodes (compiled with checkpoint support) |
-| **Container Registry** | Accessible from all nodes for checkpoint image transfer |
+| **Container Registry** | Accessible from all nodes (Registry transfer mode) |
 | **Message Broker** | RabbitMQ or any AMQP 0-9-1 compatible broker |
 | **Go** | v1.25+ (for building from source) |
 
@@ -188,6 +318,9 @@ spec:
 
   # Migration strategy: "ShadowPod" or "Sequential" (auto-detected if omitted)
   migrationStrategy: ShadowPod
+
+  # Transfer mode: "Registry" (default) or "Direct"
+  transferMode: Registry
 ```
 
 ### Status Fields
@@ -200,91 +333,13 @@ The controller populates the following status fields during the migration:
 | `sourceNode` | string | Node where the source pod is running |
 | `checkpointID` | string | Path to the CRIU checkpoint archive on the source node |
 | `targetPod` | string | Name of the restored pod on the target node |
+| `containerName` | string | Resolved container name (from spec or auto-detected as first container) |
 | `startTime` | datetime | Timestamp when the migration was initiated |
 | `phaseTimings` | map | Duration of each completed phase (e.g., `Checkpointing: 1.234s`) |
+| `statefulSetName` | string | Owning StatefulSet name (if applicable) |
+| `deploymentName` | string | Owning Deployment name (if applicable) |
+| `originalReplicas` | int32 | StatefulSet replica count before scale-down (for restore in Sequential) |
 | `conditions` | []Condition | Standard Kubernetes conditions for detailed status reporting |
-
-## Migration Strategies
-
-### ShadowPod (default for standalone pods and Deployments)
-
-The controller creates a shadow pod (e.g., `worker-0-shadow`) on the target node while the source pod is still running. Both pods coexist during the replay phase, ensuring the target can catch up on messages before traffic is switched.
-
-During finalization, cleanup depends on the workload type:
-- **Deployment-managed pods**: the source pod is deleted directly; the Deployment controller manages the desired replica count.
-- **StatefulSet-managed pods**: the StatefulSet is scaled down by one replica instead of deleting the pod directly, since direct deletion would cause the StatefulSet controller to recreate it.
-
-This strategy minimizes downtime since the source continues processing while the target replays missed messages.
-
-### Sequential (alternative for StatefulSet-managed pods)
-
-StatefulSet pods have strict identity requirements -- `worker-0` cannot exist as two pods simultaneously. The Sequential strategy scales the owning StatefulSet to zero replicas, waits for the StatefulSet controller to delete the source pod, then creates the target pod with the same identity. After migration completes, the StatefulSet is scaled back to its original replica count.
-
-This strategy incurs higher downtime than ShadowPod since the source is stopped before the target is created.
-
-### Auto-Detection
-
-When `migrationStrategy` is omitted, the controller inspects the source pod's `ownerReferences`:
-- If owned by a StatefulSet, defaults to **Sequential**.
-- Otherwise, defaults to **ShadowPod**.
-
-To use the ShadowPod strategy with a StatefulSet-managed pod, set `migrationStrategy: ShadowPod` explicitly in the CR spec.
-
-## How It Works
-
-### Message Queue Replay
-
-The replay mechanism ensures zero message loss during migration:
-
-```mermaid
-sequenceDiagram
-    participant P as Producer
-    participant E as Fanout Exchange
-    participant PQ as Primary Queue
-    participant RQ as Replay Queue
-    participant S as Source Pod
-    participant T as Target Pod
-    participant C as Controller
-
-    Note over C: Checkpointing Phase
-    C->>E: Create fanout exchange
-    C->>RQ: Create replay queue
-    C->>E: Bind PQ + RQ to exchange
-    P->>E: Publish messages
-    E->>PQ: Duplicate
-    E->>RQ: Duplicate
-    C->>S: Trigger CRIU checkpoint
-
-    Note over C: Transferring + Restoring
-    C->>T: Create target pod from checkpoint image
-
-    Note over C: Replaying Phase
-    C->>T: Send START_REPLAY (via control queue)
-    T->>RQ: Consume replay messages
-    C->>RQ: Poll queue depth
-    Note over C: Queue drained or cutoff reached
-
-    Note over C: Finalizing Phase
-    C->>T: Send END_REPLAY
-    T->>PQ: Switch to primary queue
-    C->>RQ: Delete replay queue
-    C->>S: Delete source pod
-```
-
-1. **Fan-out setup** -- Before checkpointing, the controller declares a fanout exchange and binds both the primary and a secondary replay queue. All new messages are duplicated to both queues.
-2. **Checkpoint** -- CRIU freezes the source container's process state. The container has processed all messages up to this point.
-3. **Restore** -- The target pod starts from the checkpoint image, resuming with the exact process state at checkpoint time.
-4. **Replay** -- The target pod consumes and processes messages from the replay queue (which contains every message published since the fan-out was established).
-5. **Cutover** -- Once the replay queue is drained, the target pod switches to the primary queue and the source pod is removed.
-
-### Consumer-Side Contract
-
-The target application must implement a control message listener on the queue `ms2m.control.<pod-name>` that handles two message types:
-
-| Control Message | Action |
-|:----------------|:-------|
-| `START_REPLAY` | Switch consumption from the primary queue to the replay queue specified in `payload.queue` |
-| `END_REPLAY` | Switch back to consuming from the primary queue |
 
 ## Development
 
@@ -352,7 +407,10 @@ kubectl apply -f config/crd/bases/migration.ms2m.io_statefulmigrations.yaml
 kubectl apply -f config/rbac/role.yaml
 kubectl apply -f config/manager/manager.yaml
 
-# 4. Verify
+# 4. (Optional) Deploy ms2m-agent for Direct transfer mode
+kubectl apply -f config/daemonset/ms2m-agent.yaml
+
+# 5. Verify
 kubectl get pods -l control-plane=controller-manager
 kubectl logs -l control-plane=controller-manager -f
 ```
@@ -361,32 +419,33 @@ kubectl logs -l control-plane=controller-manager -f
 
 ```
 cmd/
-  main.go                              Controller entry point
-  checkpoint-transfer/main.go          OCI image builder for checkpoint transfer
-  ms2m-agent/main.go                   Node-local agent for direct checkpoint transfer
+  main.go                              Controller entry point (controller-runtime manager)
+  checkpoint-transfer/main.go          OCI image builder for checkpoint transfer (Registry + Direct)
+  ms2m-agent/main.go                   Node-local DaemonSet agent for direct checkpoint transfer
 api/v1alpha1/
   types.go                             StatefulMigration CRD type definitions
   groupversion_info.go                 API group registration
-  deepcopy.go                          Generated deep copy functions
+  deepcopy.go                          Deep copy functions for CRD types
 internal/
   controller/
     statefulmigration_controller.go    Reconciler with phase-based state machine
+    statefulmigration_controller_test.go  Comprehensive unit tests for all phases
   checkpoint/
-    image.go                           Checkpoint OCI image builder
+    image.go                           Uncompressed OCI image builder for checkpoint tarballs
   kubelet/
     client.go                          Kubelet checkpoint API client (via API server proxy)
   messaging/
     client.go                          BrokerClient interface definition
-    rabbitmq.go                        RabbitMQ (AMQP 0-9-1) implementation
+    rabbitmq.go                        RabbitMQ implementation (fan-out, control messages, queue inspect)
     mock.go                            In-memory mock broker for unit tests
 config/
   crd/bases/                           CRD YAML with OpenAPI v3 schema
-  rbac/                                ClusterRole for the controller
+  rbac/                                ClusterRole (pods, jobs, statefulsets, deployments, nodes/proxy)
   manager/                             Controller Deployment manifest
-  daemonset/                           ms2m-agent DaemonSet for direct transfer mode
+  daemonset/                           ms2m-agent DaemonSet + Service for direct transfer mode
 eval/
-  workloads/                           Consumer workload manifests (StatefulSet + Deployment)
-  scripts/                             Evaluation automation scripts
+  workloads/                           Consumer workload manifests (StatefulSet + Deployment variants)
+  scripts/                             Automated evaluation scripts with downtime measurement
 ```
 
 ## Evaluation
@@ -395,13 +454,13 @@ The evaluation infrastructure targets bare-metal cloud VMs provisioned with `kub
 
 ### Configurations
 
-The evaluation covers three migration configurations:
+The evaluation covers three migration configurations that compare the strategies introduced in the prior papers with the new ShadowPod+StatefulSet strategy added in this operator:
 
-| Configuration | Workload | Strategy | Description |
-|:--------------|:---------|:---------|:------------|
-| `statefulset-sequential` | StatefulSet | Sequential | Baseline: source pod is killed before target is created |
-| `statefulset-shadowpod` | StatefulSet | ShadowPod | Source and target coexist; StatefulSet scaled down in finalization |
-| `deployment-registry` | Deployment | ShadowPod | Source and target coexist; source deleted in finalization |
+| Configuration | Workload | Strategy | Source |
+|:--------------|:---------|:---------|:-------|
+| `statefulset-sequential` | StatefulSet | Sequential | Described in [ICIN 2025] |
+| `statefulset-shadowpod` | StatefulSet | ShadowPod | **New in this operator** |
+| `deployment-registry` | Deployment | ShadowPod | **New in this operator** |
 
 ### Running Evaluations
 
@@ -412,7 +471,7 @@ bash eval/scripts/run_full_evaluation.sh
 # Single-configuration evaluation
 CONFIGURATION=deployment-registry bash eval/scripts/run_optimized_evaluation.sh
 
-# Combined downtime + migration time measurement (with HTTP probing)
+# Combined downtime + migration time measurement (with HTTP probing at 10ms intervals)
 bash eval/scripts/run_downtime_measurement.sh
 
 # Quick test with 1 repetition
@@ -421,29 +480,37 @@ REPETITIONS=1 bash eval/scripts/run_downtime_measurement.sh
 
 ### Metrics
 
-- **Checkpoint duration** -- Time to freeze and serialize container state
-- **Transfer duration** -- Time to package and push the OCI checkpoint image
-- **Restore duration** -- Time to pull the image and resume the container
-- **Replay duration** -- Time to drain the secondary queue and reach consistency
-- **Total migration time** -- Wall-clock time from CR creation to completion
-- **Service downtime** -- Longest contiguous period of HTTP probe failures during migration
+- **Checkpoint duration** -- Time to freeze and serialize container state via CRIU
+- **Transfer duration** -- Time to build the OCI image and push to registry (or POST to agent)
+- **Restore duration** -- Time to pull/load the image and resume the container
+- **Replay duration** -- Time to drain the secondary queue and reach message consistency
+- **Total migration time** -- Wall-clock time from CR creation to Completed phase
+- **Service downtime** -- Longest contiguous period of HTTP probe failures during migration (measured by a probe pod polling at 10ms intervals)
 - **Message loss** -- Number of messages dropped during migration (target: zero)
 
 ## Related Publications
 
-This controller is the engineering realization of a multi-year research effort on live migration of stateful microservices. The two key publications that inform this work are:
+This operator is the engineering realization of a multi-year research effort on live migration of stateful microservices:
 
 1. **H. Dinh-Tuan and F. Beierle**, "MS2M: A Message-Based Approach for Live Stateful Microservices Migration," *2022 5th Conference on Cloud and Internet of Things (CIoT)*, 2022. [[IEEE]](https://ieeexplore.ieee.org/abstract/document/9766576)
 
-   This paper introduced the core MS2M concept: instead of treating microservices as opaque containers and relying on low-level memory transfer, MS2M leverages the application's existing messaging infrastructure to reconstruct state on the target host. The proof-of-concept, built on Podman and raw CRIU, demonstrated a **19.92% reduction in service downtime** compared to traditional stop-and-copy migration. The key insight is that communication-aware migration -- one that understands an application's message flows -- offers a fundamentally different trade-off: it exchanges a brief checkpoint pause for background state synchronization via message replay, keeping the service available throughout most of the migration.
+   Introduced the core MS2M concept: leveraging an application's existing messaging infrastructure to reconstruct state on the target host via message replay, rather than relying on low-level memory transfer. The proof-of-concept was built on Podman and raw CRIU with direct host-to-host transfer (rsync/SSH), orchestrated by an imperative Python script. Demonstrated a **19.92% reduction in service downtime** compared to traditional stop-and-copy migration.
 
 2. **H. Dinh-Tuan and J. Jiang**, "Optimizing Stateful Microservice Migration in Kubernetes with MS2M and Forensic Checkpointing," *2025 28th Conference on Innovation in Clouds, Internet and Networks (ICIN)*, 2025. [[IEEE]](https://ieeexplore.ieee.org/abstract/document/10942720)
 
-   This follow-up paper bridges the gap between the MS2M concept and production Kubernetes environments. It integrates Kubernetes' native Forensic Container Checkpointing (FCC) feature as the checkpoint mechanism, extends the procedure to support StatefulSet-managed pods (which cannot coexist with duplicate identities), and introduces a **Threshold-Based Cutoff Mechanism** that bounds the replay phase to guarantee predictable migration times under high message rates. The evaluation on a Kubernetes cluster demonstrated up to **96.99% downtime reduction** compared to cold migration, while the cutoff mechanism reduced total migration time by 81.81% at high load compared to unbounded replay.
+   Bridged the gap between the MS2M concept and Kubernetes. Integrated Forensic Container Checkpointing (FCC) via the kubelet API, introduced a Sequential migration strategy for StatefulSet-managed pods, and added a Threshold-Based Cutoff Mechanism to bound the replay phase under high message rates. Still orchestrated by an imperative Python Migration Manager. Demonstrated up to **96.99% downtime reduction** compared to cold migration and 81.81% total migration time reduction at high load.
 
-### How This Controller Fits
+### Advancing Beyond the Papers
 
-This repository implements the system described in Paper 2. The original research prototypes used a Python-based Migration Manager issuing imperative commands via Podman or Kubernetes APIs. This controller replaces that with a production-grade, declarative Kubernetes operator: migrations are expressed as `StatefulMigration` custom resources, and a reconciliation loop drives the five-phase state machine (checkpoint, transfer, restore, replay, finalize) through the Kubernetes control plane. The controller also introduces OCI registry-based checkpoint transfer (replacing Rsync/SSH), automatic StatefulSet strategy detection, fan-out exchange-based message duplication, and exponential backoff polling -- none of which were part of the original research prototypes.
+This operator replaces the imperative Python Migration Manager from both papers with a declarative Kubernetes operator built on controller-runtime. Beyond this architectural shift, it introduces mechanisms not present in either publication:
+
+- **ShadowPod strategy for StatefulSet-managed pods** -- Both papers require Sequential (scale-to-zero) for StatefulSets. This operator enables source and target to coexist during replay even for StatefulSet pods, with finalization handling the scale-down. This eliminates the downtime window where the source is stopped before the target exists.
+- **Direct node-to-node checkpoint transfer** -- Both papers describe only registry-based transfer. The ms2m-agent DaemonSet enables registry-free transfer via direct HTTP POST between nodes.
+- **Deployment-aware finalization** -- Neither paper addresses Deployment-managed pods. The operator patches Deployment `nodeAffinity` to ensure replacement pods land on the target node.
+- **Automatic strategy detection** -- Inspects `ownerReferences` to select the appropriate strategy without manual configuration.
+- **Phase chaining and exponential backoff** -- Reconciler optimizations that reduce API server round-trips and load during long-running migration phases.
+- **Uncompressed OCI image layers** -- Eliminates unnecessary gzip compression for cluster-local checkpoint transfer.
+- **CRIU-aware hostname resolution** -- Solves the control queue routing problem caused by `gethostname()` returning the checkpointed UTS hostname after restore.
 
 ## License
 
