@@ -55,3 +55,7 @@ docs/plans/
 
 # Claude Code
 CLAUDE.md
+
+# Temporary artifacts
+logs/
+temp-images/
