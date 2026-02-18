@@ -72,13 +72,13 @@ stateDiagram-v2
 | **Transferring** | Launches a Transfer Job on the source node to package the checkpoint tarball as an OCI image and push it to the configured container registry. |
 | **Restoring** | Creates a target pod on the destination node using the checkpoint image. For Sequential migrations, scales down the owning StatefulSet first. |
 | **Replaying** | Sends a `START_REPLAY` control message to the target pod. Monitors the replay queue depth and proceeds to finalization when the queue is drained or the cutoff threshold is exceeded. |
-| **Finalizing** | Sends `END_REPLAY`, tears down the secondary queue, deletes the source pod (ShadowPod strategy) or scales the StatefulSet back up (Sequential strategy), and marks the migration as complete. |
+| **Finalizing** | Sends `END_REPLAY`, tears down the secondary queue, removes the source workload, and marks the migration as complete. For Sequential, the StatefulSet is scaled back to its original replica count. For ShadowPod with a Deployment, the source pod is deleted directly. For ShadowPod with a StatefulSet, the StatefulSet is scaled down by one replica. |
 
 ## Key Features
 
 - **Full process state preservation** -- CRIU captures memory, registers, file descriptors, and environment variables; the restored container resumes exactly where it left off.
 - **Zero message loss** -- Fan-out duplication to a secondary queue ensures every message published during migration is replayed by the target pod.
-- **Two migration strategies** -- ShadowPod (source and target coexist during replay) and Sequential (required for StatefulSet-managed pods with strict identity constraints).
+- **Two migration strategies** -- ShadowPod (source and target coexist during replay, works with both Deployments and StatefulSets) and Sequential (scales StatefulSet down before creating the target pod).
 - **Automatic strategy detection** -- Inspects the source pod's `ownerReferences` to select the appropriate strategy when not explicitly configured.
 - **Phase timing instrumentation** -- Records the duration of each phase in `status.phaseTimings` for performance analysis and evaluation.
 - **Exponential polling backoff** -- Adaptive requeue intervals for long-running phases (Transferring, Restoring, Replaying) to reduce API server load.
@@ -206,21 +206,29 @@ The controller populates the following status fields during the migration:
 
 ## Migration Strategies
 
-### ShadowPod (default for standalone pods)
+### ShadowPod (default for standalone pods and Deployments)
 
-The controller creates a shadow pod (e.g., `worker-0-shadow`) on the target node while the source pod is still running. Both pods coexist during the replay phase, ensuring the target can catch up on messages before traffic is switched. After finalization, the source pod is deleted.
+The controller creates a shadow pod (e.g., `worker-0-shadow`) on the target node while the source pod is still running. Both pods coexist during the replay phase, ensuring the target can catch up on messages before traffic is switched.
+
+During finalization, cleanup depends on the workload type:
+- **Deployment-managed pods**: the source pod is deleted directly; the Deployment controller manages the desired replica count.
+- **StatefulSet-managed pods**: the StatefulSet is scaled down by one replica instead of deleting the pod directly, since direct deletion would cause the StatefulSet controller to recreate it.
 
 This strategy minimizes downtime since the source continues processing while the target replays missed messages.
 
-### Sequential (required for StatefulSet-managed pods)
+### Sequential (alternative for StatefulSet-managed pods)
 
 StatefulSet pods have strict identity requirements -- `worker-0` cannot exist as two pods simultaneously. The Sequential strategy scales the owning StatefulSet to zero replicas, waits for the StatefulSet controller to delete the source pod, then creates the target pod with the same identity. After migration completes, the StatefulSet is scaled back to its original replica count.
+
+This strategy incurs higher downtime than ShadowPod since the source is stopped before the target is created.
 
 ### Auto-Detection
 
 When `migrationStrategy` is omitted, the controller inspects the source pod's `ownerReferences`:
 - If owned by a StatefulSet, defaults to **Sequential**.
 - Otherwise, defaults to **ShadowPod**.
+
+To use the ShadowPod strategy with a StatefulSet-managed pod, set `migrationStrategy: ShadowPod` explicitly in the CR spec.
 
 ## How It Works
 
@@ -355,6 +363,7 @@ kubectl logs -l control-plane=controller-manager -f
 cmd/
   main.go                              Controller entry point
   checkpoint-transfer/main.go          OCI image builder for checkpoint transfer
+  ms2m-agent/main.go                   Node-local agent for direct checkpoint transfer
 api/v1alpha1/
   types.go                             StatefulMigration CRD type definitions
   groupversion_info.go                 API group registration
@@ -362,6 +371,8 @@ api/v1alpha1/
 internal/
   controller/
     statefulmigration_controller.go    Reconciler with phase-based state machine
+  checkpoint/
+    image.go                           Checkpoint OCI image builder
   kubelet/
     client.go                          Kubelet checkpoint API client (via API server proxy)
   messaging/
@@ -372,19 +383,50 @@ config/
   crd/bases/                           CRD YAML with OpenAPI v3 schema
   rbac/                                ClusterRole for the controller
   manager/                             Controller Deployment manifest
-docs/                                  Design documents and lessons learned
-terraform/                             GKE cluster provisioning (Terraform)
+  daemonset/                           ms2m-agent DaemonSet for direct transfer mode
+eval/
+  workloads/                           Consumer workload manifests (StatefulSet + Deployment)
+  scripts/                             Evaluation automation scripts
 ```
 
 ## Evaluation
 
-The evaluation infrastructure targets bare-metal cloud VMs provisioned with `kubeadm`, running CRI-O as the container runtime with CRIU compiled from source. The test workload is a stateful message-processing microservice backed by RabbitMQ. Evaluation metrics include:
+The evaluation infrastructure targets bare-metal cloud VMs provisioned with `kubeadm`, running CRI-O as the container runtime with CRIU compiled from source. The test workload is a stateful message-processing microservice backed by RabbitMQ.
+
+### Configurations
+
+The evaluation covers three migration configurations:
+
+| Configuration | Workload | Strategy | Description |
+|:--------------|:---------|:---------|:------------|
+| `statefulset-sequential` | StatefulSet | Sequential | Baseline: source pod is killed before target is created |
+| `statefulset-shadowpod` | StatefulSet | ShadowPod | Source and target coexist; StatefulSet scaled down in finalization |
+| `deployment-registry` | Deployment | ShadowPod | Source and target coexist; source deleted in finalization |
+
+### Running Evaluations
+
+```bash
+# Full evaluation across all configurations and message rates
+bash eval/scripts/run_full_evaluation.sh
+
+# Single-configuration evaluation
+CONFIGURATION=deployment-registry bash eval/scripts/run_optimized_evaluation.sh
+
+# Combined downtime + migration time measurement (with HTTP probing)
+bash eval/scripts/run_downtime_measurement.sh
+
+# Quick test with 1 repetition
+REPETITIONS=1 bash eval/scripts/run_downtime_measurement.sh
+```
+
+### Metrics
 
 - **Checkpoint duration** -- Time to freeze and serialize container state
 - **Transfer duration** -- Time to package and push the OCI checkpoint image
 - **Restore duration** -- Time to pull the image and resume the container
 - **Replay duration** -- Time to drain the secondary queue and reach consistency
-- **Total downtime** -- End-to-end unavailability as perceived by clients
+- **Total migration time** -- Wall-clock time from CR creation to completion
+- **Service downtime** -- Longest contiguous period of HTTP probe failures during migration
 - **Message loss** -- Number of messages dropped during migration (target: zero)
 
 ## Related Publications
