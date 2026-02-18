@@ -1709,11 +1709,11 @@ func TestReconcile_Restoring_ShadowPod_WithSubdomain(t *testing.T) {
 	if err := r.Get(ctx, types.NamespacedName{Name: "myapp-0-shadow", Namespace: "default"}, targetPod); err != nil {
 		t.Fatalf("expected shadow pod to be created: %v", err)
 	}
-	if targetPod.Spec.Hostname != "myapp-0" {
-		t.Errorf("expected hostname %q, got %q", "myapp-0", targetPod.Spec.Hostname)
-	}
-	if targetPod.Spec.Subdomain != "myapp-headless" {
-		t.Errorf("expected subdomain %q, got %q", "myapp-headless", targetPod.Spec.Subdomain)
+	// Shadow pod must NOT set hostname — the consumer uses gethostname() for its
+	// control queue name, which must match the pod name (not the source pod name)
+	// so the controller can route START_REPLAY/END_REPLAY correctly.
+	if targetPod.Spec.Hostname != "" {
+		t.Errorf("expected empty hostname, got %q", targetPod.Spec.Hostname)
 	}
 }
 
@@ -2041,6 +2041,142 @@ func TestReconcile_Finalizing_Sequential_StatefulSetNotFound(t *testing.T) {
 	got := fetchMigration(r, ctx, "mig-final-nosts", "default")
 	if got.Status.Phase != migrationv1alpha1.PhaseCompleted {
 		t.Errorf("expected phase Completed when StatefulSet not found, got %q", got.Status.Phase)
+	}
+}
+
+// -- handleFinalizing: ShadowPod + StatefulSet scales down instead of deleting pod --
+func TestReconcile_Finalizing_ShadowPod_ScalesDownStatefulSet(t *testing.T) {
+	stsReplicas := int32(1)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer",
+			Namespace: "default",
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &stsReplicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "consumer"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "consumer"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}}},
+			},
+		},
+	}
+
+	sourcePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer-0",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-1",
+			Containers: []corev1.Container{
+				{Name: "app", Image: "consumer:latest"},
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	migration := newMigration("mig-final-shadow-sts", migrationv1alpha1.PhaseFinalizing)
+	migration.Spec.SourcePod = "consumer-0"
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Status.TargetPod = "consumer-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.StatefulSetName = "consumer"
+	migration.Status.PhaseTimings = map[string]string{}
+
+	r, mockBroker, ctx := setupTest(migration, sts, sourcePod)
+	mockBroker.Connected = true
+
+	_, err := reconcileOnce(r, ctx, "mig-final-shadow-sts", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-final-shadow-sts", "default")
+	if got.Status.Phase != migrationv1alpha1.PhaseCompleted {
+		t.Errorf("expected phase %q, got %q", migrationv1alpha1.PhaseCompleted, got.Status.Phase)
+	}
+
+	// Verify StatefulSet was scaled down by 1 (from 1 to 0)
+	updatedSts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "consumer", Namespace: "default"}, updatedSts); err != nil {
+		t.Fatalf("failed to get StatefulSet: %v", err)
+	}
+	if *updatedSts.Spec.Replicas != 0 {
+		t.Errorf("expected StatefulSet replicas 0, got %d", *updatedSts.Spec.Replicas)
+	}
+
+	// Verify source pod was NOT directly deleted (StatefulSet manages it)
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "consumer-0", Namespace: "default"}, pod); err != nil {
+		t.Errorf("source pod should still exist (StatefulSet will handle deletion), but got error: %v", err)
+	}
+}
+
+// -- handleFinalizing: ShadowPod + multi-replica StatefulSet scales down by 1 --
+func TestReconcile_Finalizing_ShadowPod_MultiReplicaStatefulSet(t *testing.T) {
+	stsReplicas := int32(3)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer",
+			Namespace: "default",
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &stsReplicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "consumer"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "consumer"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}}},
+			},
+		},
+	}
+
+	sourcePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer-0",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-1",
+			Containers: []corev1.Container{
+				{Name: "app", Image: "consumer:latest"},
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	migration := newMigration("mig-final-shadow-multi", migrationv1alpha1.PhaseFinalizing)
+	migration.Spec.SourcePod = "consumer-0"
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Status.TargetPod = "consumer-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.StatefulSetName = "consumer"
+	migration.Status.PhaseTimings = map[string]string{}
+
+	r, mockBroker, ctx := setupTest(migration, sts, sourcePod)
+	mockBroker.Connected = true
+
+	_, err := reconcileOnce(r, ctx, "mig-final-shadow-multi", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-final-shadow-multi", "default")
+	if got.Status.Phase != migrationv1alpha1.PhaseCompleted {
+		t.Errorf("expected phase %q, got %q", migrationv1alpha1.PhaseCompleted, got.Status.Phase)
+	}
+
+	// Verify StatefulSet was scaled down by 1 (from 3 to 2), not to 0
+	updatedSts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "consumer", Namespace: "default"}, updatedSts); err != nil {
+		t.Fatalf("failed to get StatefulSet: %v", err)
+	}
+	if *updatedSts.Spec.Replicas != 2 {
+		t.Errorf("expected StatefulSet replicas 2, got %d", *updatedSts.Spec.Replicas)
 	}
 }
 

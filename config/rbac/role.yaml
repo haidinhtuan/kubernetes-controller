@@ -82,6 +82,7 @@ rules:
   verbs:
   - get
   - list
+  - watch
 - apiGroups:
   - apps
   resources:
@@ -91,3 +92,4 @@ rules:
   - list
   - patch
   - update
+  - watch

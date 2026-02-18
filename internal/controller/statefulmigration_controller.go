@@ -485,7 +485,6 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 	}
 	var sourceContainers []corev1.Container
 	var sourceLabels map[string]string
-	var sourcePodSpec *corev1.PodSpec
 
 	if m.Spec.MigrationStrategy != "Sequential" {
 		// ShadowPod: source pod is still alive
@@ -495,7 +494,6 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 		}
 		sourceContainers = sourcePod.Spec.Containers
 		sourceLabels = sourcePod.Labels
-		sourcePodSpec = &sourcePod.Spec
 	} else if len(m.Status.SourceContainers) > 0 {
 		// Sequential: use data captured during Pending phase
 		sourceContainers = m.Status.SourceContainers
@@ -558,14 +556,6 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 			NodeName:   m.Spec.TargetNode,
 			Containers: containers,
 		},
-	}
-
-	// For ShadowPod strategy, set hostname and subdomain for DNS identity
-	if m.Spec.MigrationStrategy == "ShadowPod" && sourcePodSpec != nil {
-		newPod.Spec.Hostname = m.Spec.SourcePod
-		if sourcePodSpec.Subdomain != "" {
-			newPod.Spec.Subdomain = sourcePodSpec.Subdomain
-		}
 	}
 
 	if err := r.Create(ctx, newPod); err != nil {
@@ -666,16 +656,42 @@ func (r *StatefulMigrationReconciler) handleFinalizing(ctx context.Context, m *m
 		logger.Error(err, "Failed to delete secondary queue, continuing anyway")
 	}
 
-	// In ShadowPod strategy, the source pod is still around and needs to be removed
+	// In ShadowPod strategy, the source pod is still around and needs to be removed.
+	// For StatefulSet-owned pods, scale down the StatefulSet instead of deleting directly
+	// (direct deletion would cause the StatefulSet controller to recreate the pod).
 	if m.Spec.MigrationStrategy == "ShadowPod" {
-		sourcePod := &corev1.Pod{}
-		err := r.Get(ctx, types.NamespacedName{Name: m.Spec.SourcePod, Namespace: m.Namespace}, sourcePod)
-		if err == nil {
-			if delErr := r.Delete(ctx, sourcePod); delErr != nil {
-				logger.Error(delErr, "Failed to delete source pod", "pod", m.Spec.SourcePod)
+		if m.Status.StatefulSetName != "" {
+			// ShadowPod + StatefulSet: scale down to remove source pod.
+			// Shadow pod (with app label) continues serving via the Service.
+			sts := &appsv1.StatefulSet{}
+			if err := r.Get(ctx, types.NamespacedName{
+				Name: m.Status.StatefulSetName, Namespace: m.Namespace,
+			}, sts); err == nil {
+				if sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 {
+					newReplicas := *sts.Spec.Replicas - 1
+					stsPatch := client.MergeFrom(sts.DeepCopy())
+					sts.Spec.Replicas = &newReplicas
+					if err := r.Patch(ctx, sts, stsPatch); err != nil {
+						logger.Error(err, "Failed to scale down StatefulSet")
+					} else {
+						logger.Info("Scaled down StatefulSet for ShadowPod migration",
+							"statefulset", m.Status.StatefulSetName)
+					}
+				}
+			} else if !errors.IsNotFound(err) {
+				return ctrl.Result{}, err
 			}
-		} else if !errors.IsNotFound(err) {
-			return ctrl.Result{}, err
+		} else {
+			// ShadowPod + Deployment: delete source pod directly
+			sourcePod := &corev1.Pod{}
+			err := r.Get(ctx, types.NamespacedName{Name: m.Spec.SourcePod, Namespace: m.Namespace}, sourcePod)
+			if err == nil {
+				if delErr := r.Delete(ctx, sourcePod); delErr != nil {
+					logger.Error(delErr, "Failed to delete source pod", "pod", m.Spec.SourcePod)
+				}
+			} else if !errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
