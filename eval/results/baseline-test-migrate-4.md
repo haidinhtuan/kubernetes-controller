@@ -1,7 +1,7 @@
 # Baseline Migration Metrics (test-migrate-4)
 
 Date: 2026-02-16
-Cluster: IONOS bare-metal, 3 nodes (Ubuntu 22.04, K8s 1.31, CRI-O 1.31, CRIU 4.0)
+Cluster: bare-metal, 3 nodes (Ubuntu 22.04, K8s 1.31, CRI-O 1.31, CRIU 4.0)
 Migration: consumer-0 from worker-1 → worker-2 (Sequential/StatefulSet strategy)
 Message rate: ~10 msg/s (producer default)
 Processing delay: 50ms per message (max capacity: 20 msg/s)
@@ -64,7 +64,7 @@ Processing delay: 50ms per message (max capacity: 20 msg/s)
 
 | Metric | Ch10 (Podman) | Ch11 (K8s, StatefulSet) | Our Implementation |
 |--------|--------------|------------------------|-------------------|
-| Platform | GCP e2-medium VMs | GCE e2-medium VMs | IONOS bare-metal |
+| Platform | GCP e2-medium VMs | GCE e2-medium VMs | Bare-metal (EU) |
 | Runtime | Podman 3.1.0 | CRI-O 1.28 | CRI-O 1.31 |
 | Consumer | Java 17 Spring Boot | Java 17 Spring Boot | Python 3.11 |
 | Transfer | Rsync/SSH + Buildah | Rsync/SSH + Buildah | OCI registry |
