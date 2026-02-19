@@ -47,8 +47,8 @@ cover.out
 # Evaluation infrastructure (contains provider-specific scripts and secrets)
 eval/infra/
 
-# Evaluation results
-eval/results/
+# Reference papers (PDFs in papers/ except main.tex)
+papers/*.pdf
 
 # Internal docs
 PLAN.md
