@@ -110,6 +110,18 @@ func (r *RabbitMQClient) CreateSecondaryQueue(_ context.Context, primaryQueue, e
 	return secondaryQueue, nil
 }
 
+// UnbindQueue removes a queue's binding from an exchange. The queue
+// remains intact for draining but receives no new messages.
+func (r *RabbitMQClient) UnbindQueue(_ context.Context, queueName, exchangeName string) error {
+	if r.ch == nil {
+		return fmt.Errorf("broker channel not connected")
+	}
+	if err := r.ch.QueueUnbind(queueName, "", exchangeName, nil); err != nil {
+		return fmt.Errorf("unbind queue %q from %q: %w", queueName, exchangeName, err)
+	}
+	return nil
+}
+
 // DeleteSecondaryQueue tears down the replay setup: unbinds and deletes
 // the secondary queue. The primary queue binding and the shared exchange
 // are left intact so the producer can continue publishing.

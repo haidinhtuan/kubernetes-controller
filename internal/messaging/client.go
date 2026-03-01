@@ -32,6 +32,11 @@ type BrokerClient interface {
 	// Returns the name of the created secondary queue.
 	CreateSecondaryQueue(ctx context.Context, primaryQueue, exchangeName, routingKey string) (string, error)
 
+	// UnbindQueue removes a queue's binding from an exchange so that
+	// no new messages are routed to it. The queue itself remains intact
+	// for draining by a consumer.
+	UnbindQueue(ctx context.Context, queueName, exchangeName string) error
+
 	// DeleteSecondaryQueue removes the secondary queue and its
 	// associated exchange, restoring the original routing.
 	DeleteSecondaryQueue(ctx context.Context, secondaryQueue, primaryQueue, exchangeName string) error

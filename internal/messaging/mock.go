@@ -74,6 +74,10 @@ func (m *MockBrokerClient) CreateSecondaryQueue(_ context.Context, primaryQueue,
 	return secondaryQueue, nil
 }
 
+func (m *MockBrokerClient) UnbindQueue(_ context.Context, _, _ string) error {
+	return nil
+}
+
 func (m *MockBrokerClient) DeleteSecondaryQueue(_ context.Context, secondaryQueue, _, _ string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

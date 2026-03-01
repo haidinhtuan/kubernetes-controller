@@ -1323,6 +1323,15 @@ func (r *StatefulMigrationReconciler) handleSwapMiniReplay(ctx context.Context, 
 
 	// Send START_REPLAY on first entry (track with a phase timing key)
 	if _, ok := m.Status.PhaseTimings["Swap.MiniReplay.start"]; !ok {
+		// Unbind the swap queue from the exchange BEFORE starting replay.
+		// This stops new messages from arriving so the queue has a fixed
+		// set of messages to drain (only those buffered during re-checkpoint
+		// + transfer + create replacement). Without this, the queue grows
+		// indefinitely at high message rates and hits the cutoff timer.
+		if err := r.MsgClient.UnbindQueue(ctx, swapQueue, m.Spec.MessageQueueConfig.ExchangeName); err != nil {
+			logger.Error(err, "Failed to unbind swap queue, continuing anyway")
+		}
+
 		patch := client.MergeFrom(m.DeepCopy())
 		m.Status.PhaseTimings["Swap.MiniReplay.start"] = time.Now().Format(time.RFC3339)
 
@@ -1341,9 +1350,11 @@ func (r *StatefulMigrationReconciler) handleSwapMiniReplay(ctx context.Context, 
 		return ctrl.Result{}, false, fmt.Errorf("get swap queue depth: %w", err)
 	}
 
-	// Use the same cutoff as the main Replaying phase to avoid infinite
-	// draining when the incoming message rate exceeds consumer throughput.
-	cutoff := time.Duration(m.Spec.ReplayCutoffSeconds) * time.Second
+	// Short cutoff for MiniReplay: the queue is already unbound (fixed
+	// message set), so this only guards against consumer stalls. 15s is
+	// enough to drain the ~10s of buffered messages; if the consumer
+	// can't keep up, the main Replay cutoff already accepted that.
+	cutoff := 15 * time.Second
 	var elapsed time.Duration
 	if startStr, ok := m.Status.PhaseTimings["Swap.MiniReplay.start"]; ok {
 		if startTime, parseErr := time.Parse(time.RFC3339, startStr); parseErr == nil {
