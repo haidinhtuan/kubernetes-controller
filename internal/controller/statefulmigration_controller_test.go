@@ -662,6 +662,10 @@ func TestReconcile_Restoring_ShadowPod_PodRunning(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "myapp-0-shadow",
 			Namespace: "default",
+			Labels: map[string]string{
+				"migration.ms2m.io/migration": "mig-restore2",
+				"migration.ms2m.io/role":      "target",
+			},
 		},
 		Spec: corev1.PodSpec{
 			NodeName: "node-2",

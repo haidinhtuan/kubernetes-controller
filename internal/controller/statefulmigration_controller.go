@@ -473,6 +473,15 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 
+		// If the pod is being deleted (e.g., leftover from a previous migration)
+		// or is not owned by this migration, wait for it to be gone so we can
+		// create our own.
+		if targetPod.DeletionTimestamp != nil || targetPod.Labels["migration.ms2m.io/migration"] != m.Name {
+			logger.Info("Waiting for stale target pod to be removed", "pod", targetPodName,
+				"owner", targetPod.Labels["migration.ms2m.io/migration"], "deleting", targetPod.DeletionTimestamp != nil)
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+		}
+
 		// Target pod exists with correct identity, wait for it to be Running
 		if targetPod.Status.Phase != corev1.PodRunning {
 			logger.Info("Waiting for target pod to become Running", "pod", targetPodName, "phase", targetPod.Status.Phase)
