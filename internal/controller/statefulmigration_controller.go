@@ -1131,7 +1131,11 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
 		}
 
-		// This is the original pod on the source node — scale down the StatefulSet to remove it
+		// This is the original pod on the source node — scale down the StatefulSet
+		// to remove it. Also update the nodeSelector NOW so that the STS creates
+		// its ControllerRevision for the target node before we create the
+		// replacement pod. This prevents a revision hash mismatch that would
+		// trigger a rolling update after adoption.
 		if m.Status.StatefulSetName != "" {
 			sts := &appsv1.StatefulSet{}
 			stsErr := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts)
@@ -1146,10 +1150,19 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 				newReplicas := int32(0)
 				stsPatch := client.MergeFrom(sts.DeepCopy())
 				sts.Spec.Replicas = &newReplicas
+
+				// Update nodeSelector in the same patch so the STS
+				// generates the correct ControllerRevision immediately.
+				if sts.Spec.Template.Spec.NodeSelector == nil {
+					sts.Spec.Template.Spec.NodeSelector = make(map[string]string)
+				}
+				sts.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] = m.Spec.TargetNode
+
 				if err := r.Patch(ctx, sts, stsPatch); err != nil {
 					return ctrl.Result{}, false, fmt.Errorf("scale down StatefulSet %q for identity swap: %w", m.Status.StatefulSetName, err)
 				}
-				logger.Info("Scaled down StatefulSet for identity swap", "statefulset", m.Status.StatefulSetName)
+				logger.Info("Scaled down StatefulSet and updated nodeSelector for identity swap",
+					"statefulset", m.Status.StatefulSetName, "targetNode", m.Spec.TargetNode)
 			} else if stsErr != nil && !errors.IsNotFound(stsErr) {
 				return ctrl.Result{}, false, stsErr
 			}
@@ -1208,6 +1221,20 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 		labels[k] = v
 	}
 
+	// Use the STS's current updateRevision as the controller-revision-hash so
+	// the StatefulSet doesn't trigger a rolling update after adopting this pod.
+	// The nodeSelector was already updated during scale-down, so updateRevision
+	// reflects the target-node template.
+	if m.Status.StatefulSetName != "" {
+		sts := &appsv1.StatefulSet{}
+		if stsErr := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts); stsErr == nil {
+			if sts.Status.UpdateRevision != "" {
+				labels["controller-revision-hash"] = sts.Status.UpdateRevision
+				logger.Info("Set replacement pod revision hash from STS", "revision", sts.Status.UpdateRevision)
+			}
+		}
+	}
+
 	newPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      replacementName,
@@ -1228,36 +1255,19 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 		return ctrl.Result{}, false, fmt.Errorf("create replacement pod: %w", err)
 	}
 
-	// Immediately scale the StatefulSet back up and update its pod template
-	// nodeSelector to the target node. Without scale-up, the STS (at replicas=0)
-	// would adopt and delete our replacement. Without the nodeSelector update,
-	// the STS would recreate the pod on the old (source) node.
+	// Scale the StatefulSet back up. The nodeSelector was already updated
+	// during scale-down, so we only need to restore the replica count.
+	// Without scale-up, the STS (at replicas=0) won't adopt our replacement.
 	if m.Status.StatefulSetName != "" && m.Status.OriginalReplicas > 0 {
 		sts := &appsv1.StatefulSet{}
 		if stsErr := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts); stsErr == nil {
-			stsPatch := client.MergeFrom(sts.DeepCopy())
-			needsPatch := false
-
-			// Scale up
 			if sts.Spec.Replicas == nil || *sts.Spec.Replicas < m.Status.OriginalReplicas {
+				stsPatch := client.MergeFrom(sts.DeepCopy())
 				sts.Spec.Replicas = &m.Status.OriginalReplicas
-				needsPatch = true
-			}
-
-			// Update pod template nodeSelector to target node
-			if sts.Spec.Template.Spec.NodeSelector == nil {
-				sts.Spec.Template.Spec.NodeSelector = make(map[string]string)
-			}
-			if sts.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] != m.Spec.TargetNode {
-				sts.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] = m.Spec.TargetNode
-				needsPatch = true
-			}
-
-			if needsPatch {
 				if patchErr := r.Patch(ctx, sts, stsPatch); patchErr != nil {
-					logger.Error(patchErr, "Failed to update StatefulSet after creating replacement")
+					logger.Error(patchErr, "Failed to scale up StatefulSet after creating replacement")
 				} else {
-					logger.Info("Updated StatefulSet for identity swap", "statefulset", m.Status.StatefulSetName, "replicas", m.Status.OriginalReplicas, "targetNode", m.Spec.TargetNode)
+					logger.Info("Scaled up StatefulSet for identity swap", "statefulset", m.Status.StatefulSetName, "replicas", m.Status.OriginalReplicas)
 				}
 			}
 		}
