@@ -3721,3 +3721,138 @@ func TestReconcile_Finalizing_Swap_TrafficSwitch(t *testing.T) {
 		t.Error("expected END_REPLAY control message to replacement pod 'consumer-0'")
 	}
 }
+
+func TestReconcile_Finalizing_ShadowPod_StatefulSet_FullSwap(t *testing.T) {
+	stsReplicas := int32(1)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer",
+			Namespace: "default",
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &stsReplicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "consumer"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "consumer"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "consumer:latest", Ports: []corev1.ContainerPort{{ContainerPort: 8080}}}}},
+			},
+		},
+	}
+
+	sourcePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer-0",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "consumer"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-1",
+			Containers: []corev1.Container{{Name: "app", Image: "consumer:latest", Ports: []corev1.ContainerPort{{ContainerPort: 8080}}}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	shadowPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer-0-shadow",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "consumer", "migration.ms2m.io/migration": "mig-e2e-swap", "migration.ms2m.io/role": "target"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-2",
+			Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	migration := newMigration("mig-e2e-swap", migrationv1alpha1.PhaseFinalizing)
+	migration.Spec.SourcePod = "consumer-0"
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.TargetNode = "node-2"
+	migration.Spec.TransferMode = "Direct"
+	migration.Status.TargetPod = "consumer-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.StatefulSetName = "consumer"
+	migration.Status.ContainerName = "app"
+	migration.Status.OriginalReplicas = 1
+	migration.Status.SourcePodLabels = map[string]string{"app": "consumer"}
+	migration.Status.SourceContainers = []corev1.Container{{Name: "app", Image: "consumer:latest", Ports: []corev1.ContainerPort{{ContainerPort: 8080}}}}
+	migration.Status.PhaseTimings = map[string]string{}
+
+	r, mockBroker, ctx := setupTest(migration, sts, sourcePod, shadowPod)
+	mockBroker.Connected = true
+
+	// Reconcile loop: drive through all sub-phases.
+	// With phase chaining, this typically completes in 1 iteration since
+	// source pod exists as Running and swap queue is drained.
+	for i := 0; i < 20; i++ {
+		result, err := reconcileOnce(r, ctx, "mig-e2e-swap", "default")
+		if err != nil {
+			t.Fatalf("iteration %d: unexpected error: %v", i, err)
+		}
+
+		got := fetchMigration(r, ctx, "mig-e2e-swap", "default")
+
+		// If CreateReplacement just created a NEW pod, mark it Running
+		// (fake client doesn't simulate pod startup)
+		if got.Status.SwapSubPhase == "CreateReplacement" || got.Status.SwapSubPhase == "MiniReplay" {
+			pod := &corev1.Pod{}
+			if err := r.Get(ctx, types.NamespacedName{Name: "consumer-0", Namespace: "default"}, pod); err == nil {
+				if pod.Status.Phase != corev1.PodRunning {
+					pod.Status.Phase = corev1.PodRunning
+					_ = r.Status().Update(ctx, pod)
+				}
+			}
+		}
+
+		// If MiniReplay, ensure swap queue is drained
+		if got.Status.SwapSubPhase == "MiniReplay" {
+			mockBroker.SetQueueDepth("orders.ms2m-replay", 0)
+		}
+
+		if got.Status.Phase == migrationv1alpha1.PhaseCompleted {
+			// Verify final state
+			if got.Status.TargetPod != "consumer-0" {
+				t.Errorf("expected final TargetPod 'consumer-0', got %q", got.Status.TargetPod)
+			}
+			if got.Status.SwapSubPhase != "" {
+				t.Errorf("expected SwapSubPhase cleared, got %q", got.Status.SwapSubPhase)
+			}
+
+			// Shadow pod should be deleted
+			deletedPod := &corev1.Pod{}
+			if err := r.Get(ctx, types.NamespacedName{Name: "consumer-0-shadow", Namespace: "default"}, deletedPod); !errors.IsNotFound(err) {
+				t.Error("expected shadow pod to be deleted")
+			}
+
+			// Replacement pod should exist with correct labels
+			replacementPod := &corev1.Pod{}
+			if err := r.Get(ctx, types.NamespacedName{Name: "consumer-0", Namespace: "default"}, replacementPod); err != nil {
+				t.Fatalf("replacement pod should exist: %v", err)
+			}
+			if replacementPod.Labels["app"] != "consumer" {
+				t.Error("replacement pod should have app=consumer label")
+			}
+
+			// StatefulSet should be scaled back to 1
+			updatedSts := &appsv1.StatefulSet{}
+			if err := r.Get(ctx, types.NamespacedName{Name: "consumer", Namespace: "default"}, updatedSts); err != nil {
+				t.Fatalf("failed to get StatefulSet: %v", err)
+			}
+			if *updatedSts.Spec.Replicas != 1 {
+				t.Errorf("expected StatefulSet replicas 1, got %d", *updatedSts.Spec.Replicas)
+			}
+
+			return // Success
+		}
+
+		if !result.Requeue && result.RequeueAfter == 0 {
+			t.Fatalf("iteration %d: no requeue and not completed, phase=%s subPhase=%s",
+				i, got.Status.Phase, got.Status.SwapSubPhase)
+		}
+	}
+
+	t.Fatal("swap did not complete within 20 iterations")
+}
