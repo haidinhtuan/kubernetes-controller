@@ -1287,8 +1287,9 @@ func TestReconcile_Restoring_Sequential_WaitsForPodRemoval(t *testing.T) {
 }
 
 func TestReconcile_Finalizing_Sequential_ScalesUpStatefulSet(t *testing.T) {
-	// After Sequential migration completes, handleFinalizing should scale
-	// the StatefulSet back to its original replica count.
+	// After Sequential migration completes, handleFinalizing should:
+	// 1. Remove StatefulMigration ownerRef from target pod (for StatefulSet adoption)
+	// 2. Scale the StatefulSet back to its original replica count
 	stsReplicas := int32(0)
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1307,6 +1308,30 @@ func TestReconcile_Finalizing_Sequential_ScalesUpStatefulSet(t *testing.T) {
 		},
 	}
 
+	// Target pod with StatefulMigration ownerRef (as created by handleRestoring)
+	isController := true
+	targetPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myapp-0",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "myapp"},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "migration.ms2m.io/v1alpha1",
+					Kind:       "StatefulMigration",
+					Name:       "mig-final-scaleup",
+					UID:        "mig-uid-123",
+					Controller: &isController,
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-2",
+			Containers: []corev1.Container{{Name: "app", Image: "checkpoint:latest"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
 	migration := newMigration("mig-final-scaleup", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.MigrationStrategy = "Sequential"
 	migration.Status.TargetPod = "myapp-0"
@@ -1315,7 +1340,7 @@ func TestReconcile_Finalizing_Sequential_ScalesUpStatefulSet(t *testing.T) {
 	migration.Status.OriginalReplicas = 1
 	migration.Status.PhaseTimings = map[string]string{}
 
-	r, mockBroker, ctx := setupTest(migration, sts)
+	r, mockBroker, ctx := setupTest(migration, sts, targetPod)
 	mockBroker.Connected = true
 
 	_, err := reconcileOnce(r, ctx, "mig-final-scaleup", "default")
@@ -1326,6 +1351,17 @@ func TestReconcile_Finalizing_Sequential_ScalesUpStatefulSet(t *testing.T) {
 	got := fetchMigration(r, ctx, "mig-final-scaleup", "default")
 	if got.Status.Phase != migrationv1alpha1.PhaseCompleted {
 		t.Errorf("expected phase %q, got %q", migrationv1alpha1.PhaseCompleted, got.Status.Phase)
+	}
+
+	// Verify StatefulMigration ownerRef was removed from target pod
+	updatedPod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "myapp-0", Namespace: "default"}, updatedPod); err != nil {
+		t.Fatalf("failed to get target pod: %v", err)
+	}
+	for _, ref := range updatedPod.OwnerReferences {
+		if ref.Kind == "StatefulMigration" {
+			t.Errorf("expected StatefulMigration ownerRef to be removed from target pod, but it still exists")
+		}
 	}
 
 	// Verify StatefulSet was scaled back up

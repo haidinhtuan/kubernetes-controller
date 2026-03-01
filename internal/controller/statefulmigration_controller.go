@@ -661,8 +661,6 @@ func (r *StatefulMigrationReconciler) handleFinalizing(ctx context.Context, m *m
 	// (direct deletion would cause the StatefulSet controller to recreate the pod).
 	if m.Spec.MigrationStrategy == "ShadowPod" {
 		if m.Status.StatefulSetName != "" {
-			// ShadowPod + StatefulSet: scale down to remove source pod.
-			// Shadow pod (with app label) continues serving via the Service.
 			sts := &appsv1.StatefulSet{}
 			if err := r.Get(ctx, types.NamespacedName{
 				Name: m.Status.StatefulSetName, Namespace: m.Namespace,
@@ -682,7 +680,6 @@ func (r *StatefulMigrationReconciler) handleFinalizing(ctx context.Context, m *m
 				return ctrl.Result{}, err
 			}
 		} else {
-			// ShadowPod + Deployment: delete source pod directly
 			sourcePod := &corev1.Pod{}
 			err := r.Get(ctx, types.NamespacedName{Name: m.Spec.SourcePod, Namespace: m.Namespace}, sourcePod)
 			if err == nil {
@@ -729,8 +726,35 @@ func (r *StatefulMigrationReconciler) handleFinalizing(ctx context.Context, m *m
 		}
 	}
 
-	// For Sequential strategy, scale the StatefulSet back to its original replica count
+	// For Sequential strategy with StatefulSets: remove the StatefulMigration
+	// ownerReference from the target pod so the StatefulSet controller can adopt
+	// it, then scale the StatefulSet back to its original replica count.
 	if m.Spec.MigrationStrategy == "Sequential" && m.Status.StatefulSetName != "" && m.Status.OriginalReplicas > 0 {
+		// Remove StatefulMigration ownerRef from target pod to allow adoption
+		if m.Status.TargetPod != "" {
+			targetPod := &corev1.Pod{}
+			if err := r.Get(ctx, types.NamespacedName{Name: m.Status.TargetPod, Namespace: m.Namespace}, targetPod); err == nil {
+				filtered := make([]metav1.OwnerReference, 0, len(targetPod.OwnerReferences))
+				for _, ref := range targetPod.OwnerReferences {
+					if ref.Kind != "StatefulMigration" {
+						filtered = append(filtered, ref)
+					}
+				}
+				if len(filtered) != len(targetPod.OwnerReferences) {
+					podPatch := client.MergeFrom(targetPod.DeepCopy())
+					targetPod.OwnerReferences = filtered
+					if err := r.Patch(ctx, targetPod, podPatch); err != nil {
+						logger.Error(err, "Failed to remove ownerRef from target pod", "pod", m.Status.TargetPod)
+					} else {
+						logger.Info("Removed StatefulMigration ownerRef from target pod", "pod", m.Status.TargetPod)
+					}
+				}
+			} else if !errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Scale StatefulSet back to original replica count
 		sts := &appsv1.StatefulSet{}
 		if err := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts); err == nil {
 			if sts.Spec.Replicas == nil || *sts.Spec.Replicas < m.Status.OriginalReplicas {
