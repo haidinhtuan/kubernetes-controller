@@ -3372,3 +3372,91 @@ func TestReconcile_Transferring_RegistryMode_Unchanged(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Identity swap tests (ShadowPod + StatefulSet)
+// ---------------------------------------------------------------------------
+
+func TestReconcile_Finalizing_ShadowPod_StatefulSet_EntersSwap(t *testing.T) {
+	stsReplicas := int32(1)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer",
+			Namespace: "default",
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &stsReplicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "consumer"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "consumer"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}}},
+			},
+		},
+	}
+
+	shadowPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer-0-shadow",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "consumer", "migration.ms2m.io/migration": "mig-swap", "migration.ms2m.io/role": "target"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-2",
+			Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	sourcePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer-0",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-1",
+			Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	migration := newMigration("mig-swap", migrationv1alpha1.PhaseFinalizing)
+	migration.Spec.SourcePod = "consumer-0"
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Status.TargetPod = "consumer-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.StatefulSetName = "consumer"
+	migration.Status.ContainerName = "app"
+	migration.Status.PhaseTimings = map[string]string{}
+
+	r, mockBroker, ctx := setupTest(migration, sts, sourcePod, shadowPod)
+	mockBroker.Connected = true
+
+	result, err := reconcileOnce(r, ctx, "mig-swap", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-swap", "default")
+
+	// Should NOT complete immediately — should enter swap sub-phases
+	if got.Status.Phase == migrationv1alpha1.PhaseCompleted {
+		t.Error("expected migration to NOT complete immediately; should enter swap sub-phases")
+	}
+
+	// Should have set SwapSubPhase
+	if got.Status.SwapSubPhase == "" {
+		t.Error("expected SwapSubPhase to be set after first Finalizing reconcile for ShadowPod+StatefulSet")
+	}
+
+	// Should requeue
+	if !result.Requeue && result.RequeueAfter == 0 {
+		t.Error("expected requeue for swap sub-phase processing")
+	}
+
+	// Verify swap secondary queue was created
+	if _, exists := mockBroker.Queues["orders.ms2m-replay"]; !exists {
+		t.Error("expected swap secondary queue 'orders.ms2m-replay' to be created")
+	}
+}
