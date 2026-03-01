@@ -69,7 +69,7 @@ Pending → Checkpointing → Transferring → Restoring → Replaying → Final
 Creates a shadow pod (e.g., `consumer-0-shadow`) on the target node while the source pod continues serving traffic. Both pods coexist during the replay phase. During finalization:
 
 - **Deployment-managed pods**: Source pod is deleted; owning Deployment is patched with `nodeAffinity` for the target node.
-- **StatefulSet-managed pods**: The StatefulSet is scaled down by one replica. The shadow pod (carrying the app labels) continues serving traffic via the Service.
+- **StatefulSet-managed pods**: After migration, the controller performs a local identity swap -- re-checkpoints the shadow pod, creates a correctly-named replacement pod (`consumer-0`), replays buffered messages, then lets the StatefulSet adopt the replacement. Full StatefulSet guarantees (crash recovery, ordered scaling) are restored with zero downtime.
 
 ### Sequential (baseline)
 
@@ -81,7 +81,7 @@ When `migrationStrategy` is omitted, SHADOW inspects the source pod's `ownerRefe
 - StatefulSet → defaults to **Sequential**
 - Deployment/standalone → defaults to **ShadowPod**
 
-Set `migrationStrategy: ShadowPod` explicitly to override auto-detection for StatefulSet workloads (enables zero-downtime migration at the cost of temporary orphaning until re-adoption is implemented).
+Set `migrationStrategy: ShadowPod` explicitly to override auto-detection for StatefulSet workloads (enables zero-downtime migration with full StatefulSet re-adoption via local identity swap).
 
 ## Checkpoint Transfer Modes
 
