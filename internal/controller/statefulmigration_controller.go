@@ -644,41 +644,34 @@ func (r *StatefulMigrationReconciler) handleFinalizing(ctx context.Context, m *m
 	base := m.DeepCopy()
 	phaseStart := time.Now()
 
-	// Send END_REPLAY and tear down secondary queue.
+	// Send END_REPLAY and tear down secondary queue on first entry only.
+	// Skip during swap sub-phases to avoid destroying the swap queue.
 	// These are best-effort: if the broker channel was already closed (e.g.,
 	// a stale reconcile re-entering this handler), skip gracefully.
-	if err := r.MsgClient.SendControlMessage(ctx, m.Status.TargetPod, messaging.ControlEndReplay, nil); err != nil {
-		logger.Error(err, "Failed to send END_REPLAY, continuing anyway")
-	}
+	if m.Status.SwapSubPhase == "" {
+		if err := r.MsgClient.SendControlMessage(ctx, m.Status.TargetPod, messaging.ControlEndReplay, nil); err != nil {
+			logger.Error(err, "Failed to send END_REPLAY, continuing anyway")
+		}
 
-	secondaryQueue := m.Spec.MessageQueueConfig.QueueName + ".ms2m-replay"
-	if err := r.MsgClient.DeleteSecondaryQueue(ctx, secondaryQueue, m.Spec.MessageQueueConfig.QueueName, m.Spec.MessageQueueConfig.ExchangeName); err != nil {
-		logger.Error(err, "Failed to delete secondary queue, continuing anyway")
+		secondaryQueue := m.Spec.MessageQueueConfig.QueueName + ".ms2m-replay"
+		if err := r.MsgClient.DeleteSecondaryQueue(ctx, secondaryQueue, m.Spec.MessageQueueConfig.QueueName, m.Spec.MessageQueueConfig.ExchangeName); err != nil {
+			logger.Error(err, "Failed to delete secondary queue, continuing anyway")
+		}
 	}
 
 	// In ShadowPod strategy, the source pod is still around and needs to be removed.
-	// For StatefulSet-owned pods, scale down the StatefulSet instead of deleting directly
-	// (direct deletion would cause the StatefulSet controller to recreate the pod).
+	// For StatefulSet-owned pods, perform identity swap to restore StatefulSet ownership.
 	if m.Spec.MigrationStrategy == "ShadowPod" {
 		if m.Status.StatefulSetName != "" {
-			sts := &appsv1.StatefulSet{}
-			if err := r.Get(ctx, types.NamespacedName{
-				Name: m.Status.StatefulSetName, Namespace: m.Namespace,
-			}, sts); err == nil {
-				if sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 {
-					newReplicas := *sts.Spec.Replicas - 1
-					stsPatch := client.MergeFrom(sts.DeepCopy())
-					sts.Spec.Replicas = &newReplicas
-					if err := r.Patch(ctx, sts, stsPatch); err != nil {
-						logger.Error(err, "Failed to scale down StatefulSet")
-					} else {
-						logger.Info("Scaled down StatefulSet for ShadowPod migration",
-							"statefulset", m.Status.StatefulSetName)
-					}
-				}
-			} else if !errors.IsNotFound(err) {
-				return ctrl.Result{}, err
+			// ShadowPod + StatefulSet: perform identity swap to restore StatefulSet ownership
+			result, done, err := r.handleIdentitySwap(ctx, m, base)
+			if err != nil {
+				return result, err
 			}
+			if !done {
+				return result, nil
+			}
+			// Swap complete — fall through to normal completion
 		} else {
 			sourcePod := &corev1.Pod{}
 			err := r.Get(ctx, types.NamespacedName{Name: m.Spec.SourcePod, Namespace: m.Namespace}, sourcePod)
@@ -787,6 +780,85 @@ func (r *StatefulMigrationReconciler) handleFinalizing(ctx context.Context, m *m
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Identity swap sub-phases (ShadowPod + StatefulSet)
+// ---------------------------------------------------------------------------
+
+// handleIdentitySwap manages the local identity swap for ShadowPod+StatefulSet
+// migrations. It returns (result, done, error) where done=true means the swap
+// is complete and the caller should proceed to normal Finalizing completion.
+func (r *StatefulMigrationReconciler) handleIdentitySwap(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx)
+
+	switch m.Status.SwapSubPhase {
+	case "", "PrepareSwap":
+		return r.handleSwapPrepare(ctx, m, base)
+	case "ReCheckpoint":
+		return r.handleSwapReCheckpoint(ctx, m, base)
+	case "CreateReplacement":
+		return r.handleSwapCreateReplacement(ctx, m, base)
+	case "MiniReplay":
+		return r.handleSwapMiniReplay(ctx, m, base)
+	case "TrafficSwitch":
+		return r.handleSwapTrafficSwitch(ctx, m, base)
+	default:
+		logger.Error(nil, "Unknown swap sub-phase", "subPhase", m.Status.SwapSubPhase)
+		return ctrl.Result{}, true, nil
+	}
+}
+
+// handleSwapPrepare creates a secondary queue to buffer messages during the swap.
+func (r *StatefulMigrationReconciler) handleSwapPrepare(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx)
+
+	mqCfg := m.Spec.MessageQueueConfig
+
+	// Reconnect to broker if needed (Finalizing may have closed it in a previous attempt)
+	if err := r.MsgClient.Connect(ctx, mqCfg.BrokerURL); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("broker connect for swap: %w", err)
+	}
+
+	// Create a swap-specific secondary queue for buffering during the identity swap
+	if _, err := r.MsgClient.CreateSecondaryQueue(ctx, mqCfg.QueueName, mqCfg.ExchangeName, mqCfg.RoutingKey); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("create swap queue: %w", err)
+	}
+
+	logger.Info("PrepareSwap complete, swap queue created")
+
+	// Transition to ReCheckpoint
+	patch := client.MergeFrom(m.DeepCopy())
+	m.Status.SwapSubPhase = "ReCheckpoint"
+	if err := r.Status().Patch(ctx, m, patch); err != nil {
+		return ctrl.Result{}, false, err
+	}
+
+	return ctrl.Result{Requeue: true}, false, nil
+}
+
+// handleSwapReCheckpoint triggers a CRIU checkpoint on the shadow pod (same node, no transfer).
+func (r *StatefulMigrationReconciler) handleSwapReCheckpoint(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	// TODO: implement in next task
+	return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
+}
+
+// handleSwapCreateReplacement creates a pod with the correct StatefulSet name from the re-checkpoint image.
+func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	// TODO: implement in next task
+	return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
+}
+
+// handleSwapMiniReplay drains the swap queue into the replacement pod.
+func (r *StatefulMigrationReconciler) handleSwapMiniReplay(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	// TODO: implement in next task
+	return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
+}
+
+// handleSwapTrafficSwitch deletes the shadow pod and scales up the StatefulSet for adoption.
+func (r *StatefulMigrationReconciler) handleSwapTrafficSwitch(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	// TODO: implement in next task
+	return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
 }
 
 // ---------------------------------------------------------------------------
