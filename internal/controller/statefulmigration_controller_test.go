@@ -3505,3 +3505,80 @@ func TestReconcile_Finalizing_Swap_ReCheckpoint(t *testing.T) {
 		t.Error("expected CheckpointID to be set after re-checkpoint")
 	}
 }
+
+func TestReconcile_Finalizing_Swap_CreateReplacement(t *testing.T) {
+	stsReplicas := int32(0) // Already scaled down during initial migration
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer",
+			Namespace: "default",
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &stsReplicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "consumer"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "consumer"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "consumer:latest", Ports: []corev1.ContainerPort{{ContainerPort: 8080}}}}},
+			},
+		},
+	}
+
+	migration := newMigration("mig-swap-create", migrationv1alpha1.PhaseFinalizing)
+	migration.Spec.SourcePod = "consumer-0"
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.TargetNode = "node-2"
+	migration.Spec.TransferMode = "Direct"
+	migration.Status.TargetPod = "consumer-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.StatefulSetName = "consumer"
+	migration.Status.ContainerName = "app"
+	migration.Status.SwapSubPhase = "CreateReplacement"
+	migration.Status.CheckpointID = "/var/lib/kubelet/checkpoints/checkpoint-consumer-0-shadow.tar"
+	migration.Status.PhaseTimings = map[string]string{}
+	migration.Status.SourcePodLabels = map[string]string{"app": "consumer"}
+	migration.Status.SourceContainers = []corev1.Container{{Name: "app", Image: "consumer:latest", Ports: []corev1.ContainerPort{{ContainerPort: 8080}}}}
+
+	r, mockBroker, ctx := setupTest(migration, sts)
+	mockBroker.Connected = true
+
+	_, err := reconcileOnce(r, ctx, "mig-swap-create", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify the replacement pod was created with the correct name
+	replacementPod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "consumer-0", Namespace: "default"}, replacementPod); err != nil {
+		t.Fatalf("replacement pod 'consumer-0' not created: %v", err)
+	}
+
+	// Verify it has the app labels (for Service routing and StatefulSet adoption)
+	if replacementPod.Labels["app"] != "consumer" {
+		t.Errorf("expected label app=consumer, got %v", replacementPod.Labels["app"])
+	}
+
+	// Verify it does NOT have a controller ownerRef (so StatefulSet can adopt it)
+	for _, ref := range replacementPod.OwnerReferences {
+		if ref.Controller != nil && *ref.Controller {
+			t.Errorf("replacement pod should not have controller ownerRef, got %v", ref)
+		}
+	}
+
+	// Verify it's on the target node
+	if replacementPod.Spec.NodeName != "node-2" {
+		t.Errorf("expected pod on node-2, got %s", replacementPod.Spec.NodeName)
+	}
+
+	// Verify ports were copied from source containers
+	if len(replacementPod.Spec.Containers) == 0 || len(replacementPod.Spec.Containers[0].Ports) == 0 {
+		t.Error("expected container ports to be copied from source")
+	}
+
+	// Verify ReplacementPod status was set
+	got := fetchMigration(r, ctx, "mig-swap-create", "default")
+	if got.Status.ReplacementPod != "consumer-0" {
+		t.Errorf("expected ReplacementPod 'consumer-0', got %q", got.Status.ReplacementPod)
+	}
+}

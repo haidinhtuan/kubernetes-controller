@@ -877,9 +877,106 @@ func (r *StatefulMigrationReconciler) handleSwapReCheckpoint(ctx context.Context
 	return ctrl.Result{Requeue: true}, false, nil
 }
 
-// handleSwapCreateReplacement creates a pod with the correct StatefulSet name from the re-checkpoint image.
+// handleSwapCreateReplacement creates a pod with the correct StatefulSet name
+// (e.g., consumer-0) from the re-checkpoint image. The pod has no controller
+// ownerRef so the StatefulSet can adopt it later.
 func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
-	// TODO: implement in next task
+	logger := log.FromContext(ctx)
+
+	// The replacement pod gets the original StatefulSet pod name
+	replacementName := m.Spec.SourcePod // e.g., "consumer-0"
+
+	// Check if replacement already exists (idempotency)
+	existing := &corev1.Pod{}
+	err := r.Get(ctx, types.NamespacedName{Name: replacementName, Namespace: m.Namespace}, existing)
+	if err == nil {
+		// Pod exists — check if it's running
+		if existing.Status.Phase == corev1.PodRunning {
+			patch := client.MergeFrom(m.DeepCopy())
+			m.Status.ReplacementPod = replacementName
+			m.Status.SwapSubPhase = "MiniReplay"
+			if err := r.Status().Patch(ctx, m, patch); err != nil {
+				return ctrl.Result{}, false, err
+			}
+			return ctrl.Result{Requeue: true}, false, nil
+		}
+		// Still starting up
+		logger.Info("Waiting for replacement pod to become Running", "pod", replacementName, "phase", existing.Status.Phase)
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
+	}
+	if !errors.IsNotFound(err) {
+		return ctrl.Result{}, false, err
+	}
+
+	// Build checkpoint image reference (local, same node)
+	var checkpointImage string
+	var pullPolicy corev1.PullPolicy
+	if m.Spec.TransferMode == "Direct" {
+		checkpointImage = fmt.Sprintf("localhost/checkpoint/%s:latest", m.Status.ContainerName)
+		pullPolicy = corev1.PullNever
+	} else {
+		checkpointImage = fmt.Sprintf("%s/%s:checkpoint", m.Spec.CheckpointImageRepository, m.Status.TargetPod)
+		pullPolicy = corev1.PullAlways
+	}
+
+	// Build containers from source containers captured during Pending
+	var containers []corev1.Container
+	if len(m.Status.SourceContainers) > 0 {
+		for _, c := range m.Status.SourceContainers {
+			restored := corev1.Container{
+				Name:            c.Name,
+				Image:           checkpointImage,
+				ImagePullPolicy: pullPolicy,
+				Ports:           c.Ports,
+			}
+			if c.Name != m.Status.ContainerName {
+				restored.Image = c.Image
+			}
+			containers = append(containers, restored)
+		}
+	} else {
+		containers = []corev1.Container{{
+			Name:            m.Status.ContainerName,
+			Image:           checkpointImage,
+			ImagePullPolicy: pullPolicy,
+		}}
+	}
+
+	// Build labels from source pod labels (for Service routing + StatefulSet adoption)
+	// Do NOT include migration labels — this pod should look like a normal StatefulSet pod
+	labels := make(map[string]string)
+	for k, v := range m.Status.SourcePodLabels {
+		labels[k] = v
+	}
+
+	newPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      replacementName,
+			Namespace: m.Namespace,
+			Labels:    labels,
+			// No OwnerReferences — the StatefulSet will adopt this pod
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   m.Spec.TargetNode,
+			Containers: containers,
+		},
+	}
+
+	if err := r.Create(ctx, newPod); err != nil {
+		if errors.IsAlreadyExists(err) {
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
+		}
+		return ctrl.Result{}, false, fmt.Errorf("create replacement pod: %w", err)
+	}
+
+	// Record the replacement pod name
+	patch := client.MergeFrom(m.DeepCopy())
+	m.Status.ReplacementPod = replacementName
+	if err := r.Status().Patch(ctx, m, patch); err != nil {
+		return ctrl.Result{}, false, err
+	}
+
+	logger.Info("Created replacement pod", "pod", replacementName, "node", m.Spec.TargetNode)
 	return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
 }
 
