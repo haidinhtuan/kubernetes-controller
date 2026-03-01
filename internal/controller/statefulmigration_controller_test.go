@@ -3450,14 +3450,67 @@ func TestReconcile_Finalizing_Swap_ReCheckpoint(t *testing.T) {
 
 	got := fetchMigration(r, ctx, "mig-swap-ckpt", "default")
 
-	// Should advance to CreateReplacement
-	if got.Status.SwapSubPhase != "CreateReplacement" {
-		t.Errorf("expected SwapSubPhase %q, got %q", "CreateReplacement", got.Status.SwapSubPhase)
+	// Should advance to SwapTransfer (which builds OCI image from re-checkpoint)
+	if got.Status.SwapSubPhase != "SwapTransfer" {
+		t.Errorf("expected SwapSubPhase %q, got %q", "SwapTransfer", got.Status.SwapSubPhase)
 	}
 
 	// CheckpointID should be updated (re-checkpoint of shadow pod)
 	if got.Status.CheckpointID == "" {
 		t.Error("expected CheckpointID to be set after re-checkpoint")
+	}
+}
+
+func TestReconcile_Finalizing_Swap_SwapTransfer(t *testing.T) {
+	migration := newMigration("mig-swap-xfer", migrationv1alpha1.PhaseFinalizing)
+	migration.Spec.SourcePod = "consumer-0"
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.TargetNode = "node-2"
+	migration.Spec.CheckpointImageRepository = "registry.example.com/checkpoints"
+	migration.Status.TargetPod = "consumer-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.StatefulSetName = "consumer"
+	migration.Status.ContainerName = "app"
+	migration.Status.SwapSubPhase = "SwapTransfer"
+	migration.Status.CheckpointID = "/var/lib/kubelet/checkpoints/checkpoint-consumer-0-shadow.tar"
+	migration.Status.PhaseTimings = map[string]string{}
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+
+	// First reconcile: creates the transfer job
+	_, err := reconcileOnce(r, ctx, "mig-swap-xfer", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify transfer job was created on target node
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "mig-swap-xfer-swap-transfer", Namespace: "default"}, job); err != nil {
+		t.Fatalf("swap transfer job not created: %v", err)
+	}
+	if job.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] != "node-2" {
+		t.Error("expected swap transfer job on target node (node-2)")
+	}
+	// Verify image ref uses :recheckpoint tag
+	args := job.Spec.Template.Spec.Containers[0].Args
+	if len(args) < 2 || args[1] != "registry.example.com/checkpoints/consumer-0-shadow:recheckpoint" {
+		t.Errorf("expected recheckpoint image ref, got args: %v", args)
+	}
+
+	// Simulate job completion
+	job.Status.Succeeded = 1
+	_ = r.Status().Update(ctx, job)
+
+	// Second reconcile: transitions to CreateReplacement
+	_, err = reconcileOnce(r, ctx, "mig-swap-xfer", "default")
+	if err != nil {
+		t.Fatalf("unexpected error after job completion: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-swap-xfer", "default")
+	if got.Status.SwapSubPhase != "CreateReplacement" {
+		t.Errorf("expected SwapSubPhase %q, got %q", "CreateReplacement", got.Status.SwapSubPhase)
 	}
 }
 
@@ -3787,7 +3840,7 @@ func TestReconcile_Finalizing_ShadowPod_StatefulSet_FullSwap(t *testing.T) {
 	// Reconcile loop: drive through all sub-phases.
 	// With phase chaining, this typically completes in 1 iteration since
 	// source pod exists as Running and swap queue is drained.
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 30; i++ {
 		result, err := reconcileOnce(r, ctx, "mig-e2e-swap", "default")
 		if err != nil {
 			t.Fatalf("iteration %d: unexpected error: %v", i, err)
@@ -3795,9 +3848,36 @@ func TestReconcile_Finalizing_ShadowPod_StatefulSet_FullSwap(t *testing.T) {
 
 		got := fetchMigration(r, ctx, "mig-e2e-swap", "default")
 
-		// If CreateReplacement just created a NEW pod, mark it Running
-		// (fake client doesn't simulate pod startup)
-		if got.Status.SwapSubPhase == "CreateReplacement" || got.Status.SwapSubPhase == "MiniReplay" {
+		// If SwapTransfer just created a job, mark it as succeeded
+		// (fake client doesn't simulate job execution)
+		if got.Status.SwapSubPhase == "SwapTransfer" {
+			job := &batchv1.Job{}
+			if err := r.Get(ctx, types.NamespacedName{Name: "mig-e2e-swap-swap-transfer", Namespace: "default"}, job); err == nil {
+				if job.Status.Succeeded == 0 {
+					job.Status.Succeeded = 1
+					_ = r.Status().Update(ctx, job)
+				}
+			}
+		}
+
+		// If CreateReplacement is waiting to remove the original pod, simulate
+		// StatefulSet controller behavior: delete consumer-0 on node-1
+		if got.Status.SwapSubPhase == "CreateReplacement" {
+			pod := &corev1.Pod{}
+			if err := r.Get(ctx, types.NamespacedName{Name: "consumer-0", Namespace: "default"}, pod); err == nil {
+				if pod.Spec.NodeName == "node-1" {
+					// Simulate StatefulSet controller deleting old pod (replicas=0)
+					_ = r.Delete(ctx, pod)
+				} else if pod.Status.Phase != corev1.PodRunning {
+					// Replacement pod on target node — mark Running
+					pod.Status.Phase = corev1.PodRunning
+					_ = r.Status().Update(ctx, pod)
+				}
+			}
+		}
+
+		// If MiniReplay, ensure replacement pod is Running
+		if got.Status.SwapSubPhase == "MiniReplay" {
 			pod := &corev1.Pod{}
 			if err := r.Get(ctx, types.NamespacedName{Name: "consumer-0", Namespace: "default"}, pod); err == nil {
 				if pod.Status.Phase != corev1.PodRunning {
@@ -3854,5 +3934,5 @@ func TestReconcile_Finalizing_ShadowPod_StatefulSet_FullSwap(t *testing.T) {
 		}
 	}
 
-	t.Fatal("swap did not complete within 20 iterations")
+	t.Fatal("swap did not complete within 30 iterations")
 }

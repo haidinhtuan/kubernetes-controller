@@ -642,7 +642,14 @@ func (r *StatefulMigrationReconciler) handleReplaying(ctx context.Context, m *mi
 func (r *StatefulMigrationReconciler) handleFinalizing(ctx context.Context, m *migrationv1alpha1.StatefulMigration) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	base := m.DeepCopy()
-	phaseStart := time.Now()
+	ensurePhaseTimings(m)
+
+	// Record phase start time (only on first entry)
+	if _, ok := m.Status.PhaseTimings["Finalizing.start"]; !ok {
+		patch := client.MergeFrom(m.DeepCopy())
+		m.Status.PhaseTimings["Finalizing.start"] = time.Now().Format(time.RFC3339)
+		_ = r.Status().Patch(ctx, m, patch)
+	}
 
 	// Send END_REPLAY and tear down secondary queue on first entry only.
 	// Skip during swap sub-phases to avoid destroying the swap queue.
@@ -769,13 +776,22 @@ func (r *StatefulMigrationReconciler) handleFinalizing(ctx context.Context, m *m
 		logger.Error(err, "Failed to close broker connection")
 	}
 
-	r.recordPhaseTiming(m, "Finalizing", time.Since(phaseStart))
+	// Calculate Finalizing duration from the start time recorded on first entry
+	var finalizeDuration time.Duration
+	if startStr, ok := m.Status.PhaseTimings["Finalizing.start"]; ok {
+		if startTime, parseErr := time.Parse(time.RFC3339, startStr); parseErr == nil {
+			finalizeDuration = time.Since(startTime)
+		}
+		delete(m.Status.PhaseTimings, "Finalizing.start")
+	}
+	r.recordPhaseTiming(m, "Finalizing", finalizeDuration)
 	logger.Info("Migration finalized successfully")
 
 	// Use direct patch instead of transitionPhase to avoid phase chaining.
 	// The informer cache may return a stale "Finalizing" phase after the patch,
 	// causing the loop to re-enter handleFinalizing with a nil broker channel.
 	m.Status.Phase = migrationv1alpha1.PhaseCompleted
+	m.Status.SwapSubPhase = "" // Ensure swap sub-phase is cleared
 	if err := r.Status().Patch(ctx, m, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -793,10 +809,19 @@ func (r *StatefulMigrationReconciler) handleIdentitySwap(ctx context.Context, m 
 	logger := log.FromContext(ctx)
 
 	switch m.Status.SwapSubPhase {
-	case "", "PrepareSwap":
+	case "":
+		// If ReplacementPod is already set, the swap completed and
+		// TrafficSwitch cleared SwapSubPhase. Don't re-enter the swap.
+		if m.Status.ReplacementPod != "" {
+			return ctrl.Result{}, true, nil
+		}
+		return r.handleSwapPrepare(ctx, m, base)
+	case "PrepareSwap":
 		return r.handleSwapPrepare(ctx, m, base)
 	case "ReCheckpoint":
 		return r.handleSwapReCheckpoint(ctx, m, base)
+	case "SwapTransfer":
+		return r.handleSwapTransfer(ctx, m, base)
 	case "CreateReplacement":
 		return r.handleSwapCreateReplacement(ctx, m, base)
 	case "MiniReplay":
@@ -858,7 +883,7 @@ func (r *StatefulMigrationReconciler) handleSwapReCheckpoint(ctx context.Context
 		if len(resp.Items) > 0 {
 			patch := client.MergeFrom(m.DeepCopy())
 			m.Status.CheckpointID = resp.Items[0]
-			m.Status.SwapSubPhase = "CreateReplacement"
+			m.Status.SwapSubPhase = "SwapTransfer"
 			if err := r.Status().Patch(ctx, m, patch); err != nil {
 				return ctrl.Result{}, false, err
 			}
@@ -867,7 +892,7 @@ func (r *StatefulMigrationReconciler) handleSwapReCheckpoint(ctx context.Context
 		// Test/dev fallback
 		patch := client.MergeFrom(m.DeepCopy())
 		m.Status.CheckpointID = fmt.Sprintf("/var/lib/kubelet/checkpoints/checkpoint-%s.tar", m.Status.TargetPod)
-		m.Status.SwapSubPhase = "CreateReplacement"
+		m.Status.SwapSubPhase = "SwapTransfer"
 		if err := r.Status().Patch(ctx, m, patch); err != nil {
 			return ctrl.Result{}, false, err
 		}
@@ -877,45 +902,194 @@ func (r *StatefulMigrationReconciler) handleSwapReCheckpoint(ctx context.Context
 	return ctrl.Result{Requeue: true}, false, nil
 }
 
+// handleSwapTransfer builds an OCI image from the re-checkpoint tar and makes
+// it available for CreateReplacement. For Registry mode, it pushes to the
+// registry. For Direct mode, it sends to the local ms2m-agent. This runs on
+// the TARGET node (where the re-checkpoint tar is located).
+func (r *StatefulMigrationReconciler) handleSwapTransfer(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx)
+
+	jobName := m.Name + "-swap-transfer"
+
+	existingJob := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: m.Namespace}, existingJob)
+
+	if errors.IsNotFound(err) {
+		// Build transfer args based on mode (same logic as handleTransferring)
+		var transferArgs []string
+		if m.Spec.TransferMode == "Direct" {
+			agentURL := fmt.Sprintf("http://ms2m-agent.ms2m-system.svc.cluster.local:9443/checkpoint")
+			transferArgs = []string{m.Status.CheckpointID, agentURL, m.Status.ContainerName}
+		} else {
+			imageRef := fmt.Sprintf("%s/%s:recheckpoint", m.Spec.CheckpointImageRepository, m.Status.TargetPod)
+			transferArgs = []string{m.Status.CheckpointID, imageRef, m.Status.ContainerName}
+		}
+
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      jobName,
+				Namespace: m.Namespace,
+				Labels: map[string]string{
+					"migration.ms2m.io/migration": m.Name,
+					"migration.ms2m.io/phase":     "swap-transfer",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					*metav1.NewControllerRef(m, migrationv1alpha1.GroupVersion.WithKind("StatefulMigration")),
+				},
+			},
+			Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						RestartPolicy: corev1.RestartPolicyNever,
+						NodeSelector: map[string]string{
+							"kubernetes.io/hostname": m.Spec.TargetNode,
+						},
+						Containers: []corev1.Container{
+							{
+								Name:            "checkpoint-transfer",
+								Image:           "localhost/checkpoint-transfer:latest",
+								ImagePullPolicy: corev1.PullIfNotPresent,
+								Args:            transferArgs,
+								Env: []corev1.EnvVar{
+									{
+										Name:  "INSECURE_REGISTRY",
+										Value: "true",
+									},
+								},
+								SecurityContext: &corev1.SecurityContext{
+									RunAsUser:  func() *int64 { uid := int64(0); return &uid }(),
+									RunAsGroup: func() *int64 { gid := int64(0); return &gid }(),
+								},
+								VolumeMounts: []corev1.VolumeMount{
+									{
+										Name:      "checkpoints",
+										MountPath: "/var/lib/kubelet/checkpoints",
+										ReadOnly:  true,
+									},
+								},
+							},
+						},
+						Volumes: []corev1.Volume{
+							{
+								Name: "checkpoints",
+								VolumeSource: corev1.VolumeSource{
+									HostPath: &corev1.HostPathVolumeSource{
+										Path: "/var/lib/kubelet/checkpoints",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		if err := r.Create(ctx, job); err != nil {
+			if errors.IsAlreadyExists(err) {
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, false, nil
+			}
+			return ctrl.Result{}, false, fmt.Errorf("create swap transfer job: %w", err)
+		}
+
+		logger.Info("Created swap transfer job", "job", jobName)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, false, nil
+	} else if err != nil {
+		return ctrl.Result{}, false, err
+	}
+
+	// Job exists — check completion
+	if existingJob.Status.Succeeded >= 1 {
+		logger.Info("Swap transfer job completed", "job", jobName)
+		patch := client.MergeFrom(m.DeepCopy())
+		m.Status.SwapSubPhase = "CreateReplacement"
+		if err := r.Status().Patch(ctx, m, patch); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{Requeue: true}, false, nil
+	}
+
+	if existingJob.Status.Failed > 0 {
+		return ctrl.Result{}, false, fmt.Errorf("swap transfer job %q failed", jobName)
+	}
+
+	logger.Info("Waiting for swap transfer job", "job", jobName)
+	return ctrl.Result{RequeueAfter: 2 * time.Second}, false, nil
+}
+
 // handleSwapCreateReplacement creates a pod with the correct StatefulSet name
 // (e.g., consumer-0) from the re-checkpoint image. The pod has no controller
 // ownerRef so the StatefulSet can adopt it later.
+//
+// For ShadowPod+StatefulSet, the original pod is still running on the source node.
+// We must scale down the StatefulSet to remove it before creating the replacement
+// on the target node.
 func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
 	logger := log.FromContext(ctx)
 
 	// The replacement pod gets the original StatefulSet pod name
 	replacementName := m.Spec.SourcePod // e.g., "consumer-0"
 
-	// Check if replacement already exists (idempotency)
+	// Check if a pod with the replacement name already exists
 	existing := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Name: replacementName, Namespace: m.Namespace}, existing)
 	if err == nil {
-		// Pod exists — check if it's running
-		if existing.Status.Phase == corev1.PodRunning {
-			patch := client.MergeFrom(m.DeepCopy())
-			m.Status.ReplacementPod = replacementName
-			m.Status.SwapSubPhase = "MiniReplay"
-			if err := r.Status().Patch(ctx, m, patch); err != nil {
-				return ctrl.Result{}, false, err
+		// Pod exists — distinguish between the original (source node) and a replacement we created (target node)
+		if existing.Spec.NodeName == m.Spec.TargetNode {
+			// This is the replacement pod we created — wait for it to be Running
+			if existing.Status.Phase == corev1.PodRunning {
+				patch := client.MergeFrom(m.DeepCopy())
+				m.Status.ReplacementPod = replacementName
+				m.Status.SwapSubPhase = "MiniReplay"
+				if err := r.Status().Patch(ctx, m, patch); err != nil {
+					return ctrl.Result{}, false, err
+				}
+				return ctrl.Result{Requeue: true}, false, nil
 			}
-			return ctrl.Result{Requeue: true}, false, nil
+			// Still starting up
+			logger.Info("Waiting for replacement pod to become Running", "pod", replacementName, "phase", existing.Status.Phase)
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
 		}
-		// Still starting up
-		logger.Info("Waiting for replacement pod to become Running", "pod", replacementName, "phase", existing.Status.Phase)
-		return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
+
+		// This is the original pod on the source node — scale down the StatefulSet to remove it
+		if m.Status.StatefulSetName != "" {
+			sts := &appsv1.StatefulSet{}
+			stsErr := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts)
+			if stsErr == nil && sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 {
+				// Save original replicas before scaling down
+				if m.Status.OriginalReplicas == 0 {
+					patch := client.MergeFrom(m.DeepCopy())
+					m.Status.OriginalReplicas = *sts.Spec.Replicas
+					_ = r.Status().Patch(ctx, m, patch)
+				}
+
+				newReplicas := int32(0)
+				stsPatch := client.MergeFrom(sts.DeepCopy())
+				sts.Spec.Replicas = &newReplicas
+				if err := r.Patch(ctx, sts, stsPatch); err != nil {
+					return ctrl.Result{}, false, fmt.Errorf("scale down StatefulSet %q for identity swap: %w", m.Status.StatefulSetName, err)
+				}
+				logger.Info("Scaled down StatefulSet for identity swap", "statefulset", m.Status.StatefulSetName)
+			} else if stsErr != nil && !errors.IsNotFound(stsErr) {
+				return ctrl.Result{}, false, stsErr
+			}
+		}
+
+		// Wait for the StatefulSet controller to delete the original pod
+		logger.Info("Waiting for original pod to be removed by StatefulSet controller", "pod", replacementName, "node", existing.Spec.NodeName)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, false, nil
 	}
 	if !errors.IsNotFound(err) {
 		return ctrl.Result{}, false, err
 	}
 
-	// Build checkpoint image reference (local, same node)
+	// Build checkpoint image reference from the re-checkpoint (pushed by SwapTransfer)
 	var checkpointImage string
 	var pullPolicy corev1.PullPolicy
 	if m.Spec.TransferMode == "Direct" {
 		checkpointImage = fmt.Sprintf("localhost/checkpoint/%s:latest", m.Status.ContainerName)
 		pullPolicy = corev1.PullNever
 	} else {
-		checkpointImage = fmt.Sprintf("%s/%s:checkpoint", m.Spec.CheckpointImageRepository, m.Status.TargetPod)
+		checkpointImage = fmt.Sprintf("%s/%s:recheckpoint", m.Spec.CheckpointImageRepository, m.Status.TargetPod)
 		pullPolicy = corev1.PullAlways
 	}
 
@@ -967,6 +1141,41 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
 		}
 		return ctrl.Result{}, false, fmt.Errorf("create replacement pod: %w", err)
+	}
+
+	// Immediately scale the StatefulSet back up and update its pod template
+	// nodeSelector to the target node. Without scale-up, the STS (at replicas=0)
+	// would adopt and delete our replacement. Without the nodeSelector update,
+	// the STS would recreate the pod on the old (source) node.
+	if m.Status.StatefulSetName != "" && m.Status.OriginalReplicas > 0 {
+		sts := &appsv1.StatefulSet{}
+		if stsErr := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts); stsErr == nil {
+			stsPatch := client.MergeFrom(sts.DeepCopy())
+			needsPatch := false
+
+			// Scale up
+			if sts.Spec.Replicas == nil || *sts.Spec.Replicas < m.Status.OriginalReplicas {
+				sts.Spec.Replicas = &m.Status.OriginalReplicas
+				needsPatch = true
+			}
+
+			// Update pod template nodeSelector to target node
+			if sts.Spec.Template.Spec.NodeSelector == nil {
+				sts.Spec.Template.Spec.NodeSelector = make(map[string]string)
+			}
+			if sts.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] != m.Spec.TargetNode {
+				sts.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] = m.Spec.TargetNode
+				needsPatch = true
+			}
+
+			if needsPatch {
+				if patchErr := r.Patch(ctx, sts, stsPatch); patchErr != nil {
+					logger.Error(patchErr, "Failed to update StatefulSet after creating replacement")
+				} else {
+					logger.Info("Updated StatefulSet for identity swap", "statefulset", m.Status.StatefulSetName, "replicas", m.Status.OriginalReplicas, "targetNode", m.Spec.TargetNode)
+				}
+			}
+		}
 	}
 
 	// Record the replacement pod name

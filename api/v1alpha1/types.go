@@ -107,7 +107,7 @@ type StatefulMigrationStatus struct {
 
 	// SwapSubPhase tracks progress of the local identity swap for ShadowPod+StatefulSet.
 	// Empty when not performing a swap.
-	SwapSubPhase string `json:"swapSubPhase,omitempty"`
+	SwapSubPhase string `json:"swapSubPhase"`
 
 	// ReplacementPod is the name of the correctly-named replacement pod created during identity swap.
 	ReplacementPod string `json:"replacementPod,omitempty"`
