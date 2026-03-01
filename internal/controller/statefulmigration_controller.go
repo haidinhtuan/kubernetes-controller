@@ -808,29 +808,49 @@ func (r *StatefulMigrationReconciler) handleFinalizing(ctx context.Context, m *m
 func (r *StatefulMigrationReconciler) handleIdentitySwap(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
 	logger := log.FromContext(ctx)
 
-	switch m.Status.SwapSubPhase {
-	case "":
-		// If ReplacementPod is already set, the swap completed and
-		// TrafficSwitch cleared SwapSubPhase. Don't re-enter the swap.
-		if m.Status.ReplacementPod != "" {
+	// Sub-phase chaining loop: when a sub-phase completes synchronously
+	// (Requeue: true, no delay), re-fetch and immediately dispatch the next
+	// sub-phase instead of going back through the main reconcile loop.
+	for {
+		var result ctrl.Result
+		var done bool
+		var err error
+
+		switch m.Status.SwapSubPhase {
+		case "":
+			if m.Status.ReplacementPod != "" {
+				return ctrl.Result{}, true, nil
+			}
+			result, done, err = r.handleSwapPrepare(ctx, m, base)
+		case "PrepareSwap":
+			result, done, err = r.handleSwapPrepare(ctx, m, base)
+		case "ReCheckpoint":
+			result, done, err = r.handleSwapReCheckpoint(ctx, m, base)
+		case "SwapTransfer":
+			result, done, err = r.handleSwapTransfer(ctx, m, base)
+		case "CreateReplacement":
+			result, done, err = r.handleSwapCreateReplacement(ctx, m, base)
+		case "MiniReplay":
+			result, done, err = r.handleSwapMiniReplay(ctx, m, base)
+		case "TrafficSwitch":
+			result, done, err = r.handleSwapTrafficSwitch(ctx, m, base)
+		default:
+			logger.Error(nil, "Unknown swap sub-phase", "subPhase", m.Status.SwapSubPhase)
 			return ctrl.Result{}, true, nil
 		}
-		return r.handleSwapPrepare(ctx, m, base)
-	case "PrepareSwap":
-		return r.handleSwapPrepare(ctx, m, base)
-	case "ReCheckpoint":
-		return r.handleSwapReCheckpoint(ctx, m, base)
-	case "SwapTransfer":
-		return r.handleSwapTransfer(ctx, m, base)
-	case "CreateReplacement":
-		return r.handleSwapCreateReplacement(ctx, m, base)
-	case "MiniReplay":
-		return r.handleSwapMiniReplay(ctx, m, base)
-	case "TrafficSwitch":
-		return r.handleSwapTrafficSwitch(ctx, m, base)
-	default:
-		logger.Error(nil, "Unknown swap sub-phase", "subPhase", m.Status.SwapSubPhase)
-		return ctrl.Result{}, true, nil
+
+		// Return immediately on error, completion, delayed requeue, or no requeue
+		if err != nil || done || result.RequeueAfter > 0 || !result.Requeue {
+			return result, done, err
+		}
+
+		// Requeue: true means sub-phase completed synchronously.
+		// Re-fetch and continue to the next sub-phase.
+		key := client.ObjectKeyFromObject(m)
+		if fetchErr := r.Get(ctx, key, m); fetchErr != nil {
+			return ctrl.Result{}, false, fetchErr
+		}
+		base = m.DeepCopy()
 	}
 }
 
