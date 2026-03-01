@@ -902,29 +902,20 @@ func (r *StatefulMigrationReconciler) handleSwapReCheckpoint(ctx context.Context
 	return ctrl.Result{Requeue: true}, false, nil
 }
 
-// handleSwapTransfer builds an OCI image from the re-checkpoint tar and makes
-// it available for CreateReplacement. For Registry mode, it pushes to the
-// registry. For Direct mode, it sends to the local ms2m-agent. This runs on
-// the TARGET node (where the re-checkpoint tar is located).
+// handleSwapTransfer loads the re-checkpoint into the target node's local
+// containers-storage via the ms2m-agent's local-load command. Since the
+// re-checkpoint tar is already on the target node, no network transfer is
+// needed — just build the OCI image and load it locally via skopeo.
 func (r *StatefulMigrationReconciler) handleSwapTransfer(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
 	logger := log.FromContext(ctx)
 
 	jobName := m.Name + "-swap-transfer"
+	imageTag := fmt.Sprintf("localhost/checkpoint/%s:recheckpoint", m.Status.ContainerName)
 
 	existingJob := &batchv1.Job{}
 	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: m.Namespace}, existingJob)
 
 	if errors.IsNotFound(err) {
-		// Build transfer args based on mode (same logic as handleTransferring)
-		var transferArgs []string
-		if m.Spec.TransferMode == "Direct" {
-			agentURL := fmt.Sprintf("http://ms2m-agent.ms2m-system.svc.cluster.local:9443/checkpoint")
-			transferArgs = []string{m.Status.CheckpointID, agentURL, m.Status.ContainerName}
-		} else {
-			imageRef := fmt.Sprintf("%s/%s:recheckpoint", m.Spec.CheckpointImageRepository, m.Status.TargetPod)
-			transferArgs = []string{m.Status.CheckpointID, imageRef, m.Status.ContainerName}
-		}
-
 		job := &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      jobName,
@@ -946,17 +937,12 @@ func (r *StatefulMigrationReconciler) handleSwapTransfer(ctx context.Context, m 
 						},
 						Containers: []corev1.Container{
 							{
-								Name:            "checkpoint-transfer",
-								Image:           "localhost/checkpoint-transfer:latest",
+								Name:            "local-load",
+								Image:           "localhost/ms2m-agent:latest",
 								ImagePullPolicy: corev1.PullIfNotPresent,
-								Args:            transferArgs,
-								Env: []corev1.EnvVar{
-									{
-										Name:  "INSECURE_REGISTRY",
-										Value: "true",
-									},
-								},
+								Args:            []string{"local-load", m.Status.CheckpointID, m.Status.ContainerName, imageTag},
 								SecurityContext: &corev1.SecurityContext{
+									Privileged: func() *bool { b := true; return &b }(),
 									RunAsUser:  func() *int64 { uid := int64(0); return &uid }(),
 									RunAsGroup: func() *int64 { gid := int64(0); return &gid }(),
 								},
@@ -965,6 +951,10 @@ func (r *StatefulMigrationReconciler) handleSwapTransfer(ctx context.Context, m 
 										Name:      "checkpoints",
 										MountPath: "/var/lib/kubelet/checkpoints",
 										ReadOnly:  true,
+									},
+									{
+										Name:      "containers-storage",
+										MountPath: "/var/lib/containers/storage",
 									},
 								},
 							},
@@ -975,6 +965,14 @@ func (r *StatefulMigrationReconciler) handleSwapTransfer(ctx context.Context, m 
 								VolumeSource: corev1.VolumeSource{
 									HostPath: &corev1.HostPathVolumeSource{
 										Path: "/var/lib/kubelet/checkpoints",
+									},
+								},
+							},
+							{
+								Name: "containers-storage",
+								VolumeSource: corev1.VolumeSource{
+									HostPath: &corev1.HostPathVolumeSource{
+										Path: "/var/lib/containers/storage",
 									},
 								},
 							},
@@ -991,7 +989,7 @@ func (r *StatefulMigrationReconciler) handleSwapTransfer(ctx context.Context, m 
 			return ctrl.Result{}, false, fmt.Errorf("create swap transfer job: %w", err)
 		}
 
-		logger.Info("Created swap transfer job", "job", jobName)
+		logger.Info("Created swap local-load job", "job", jobName, "imageTag", imageTag)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, false, nil
 	} else if err != nil {
 		return ctrl.Result{}, false, err
@@ -999,7 +997,7 @@ func (r *StatefulMigrationReconciler) handleSwapTransfer(ctx context.Context, m 
 
 	// Job exists — check completion
 	if existingJob.Status.Succeeded >= 1 {
-		logger.Info("Swap transfer job completed", "job", jobName)
+		logger.Info("Swap local-load job completed", "job", jobName)
 		patch := client.MergeFrom(m.DeepCopy())
 		m.Status.SwapSubPhase = "CreateReplacement"
 		if err := r.Status().Patch(ctx, m, patch); err != nil {
@@ -1009,10 +1007,10 @@ func (r *StatefulMigrationReconciler) handleSwapTransfer(ctx context.Context, m 
 	}
 
 	if existingJob.Status.Failed > 0 {
-		return ctrl.Result{}, false, fmt.Errorf("swap transfer job %q failed", jobName)
+		return ctrl.Result{}, false, fmt.Errorf("swap local-load job %q failed", jobName)
 	}
 
-	logger.Info("Waiting for swap transfer job", "job", jobName)
+	logger.Info("Waiting for swap local-load job", "job", jobName)
 	return ctrl.Result{RequeueAfter: 2 * time.Second}, false, nil
 }
 
@@ -1082,16 +1080,10 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 		return ctrl.Result{}, false, err
 	}
 
-	// Build checkpoint image reference from the re-checkpoint (pushed by SwapTransfer)
-	var checkpointImage string
-	var pullPolicy corev1.PullPolicy
-	if m.Spec.TransferMode == "Direct" {
-		checkpointImage = fmt.Sprintf("localhost/checkpoint/%s:latest", m.Status.ContainerName)
-		pullPolicy = corev1.PullNever
-	} else {
-		checkpointImage = fmt.Sprintf("%s/%s:recheckpoint", m.Spec.CheckpointImageRepository, m.Status.TargetPod)
-		pullPolicy = corev1.PullAlways
-	}
+	// The re-checkpoint was loaded into local containers-storage by SwapTransfer
+	// (same node, no registry needed)
+	checkpointImage := fmt.Sprintf("localhost/checkpoint/%s:recheckpoint", m.Status.ContainerName)
+	pullPolicy := corev1.PullNever
 
 	// Build containers from source containers captured during Pending
 	var containers []corev1.Container

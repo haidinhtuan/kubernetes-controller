@@ -3492,10 +3492,20 @@ func TestReconcile_Finalizing_Swap_SwapTransfer(t *testing.T) {
 	if job.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] != "node-2" {
 		t.Error("expected swap transfer job on target node (node-2)")
 	}
-	// Verify image ref uses :recheckpoint tag
+	// Verify local-load args: local-load <tar-path> <container-name> <image-tag>
 	args := job.Spec.Template.Spec.Containers[0].Args
-	if len(args) < 2 || args[1] != "registry.example.com/checkpoints/consumer-0-shadow:recheckpoint" {
-		t.Errorf("expected recheckpoint image ref, got args: %v", args)
+	expectedArgs := []string{
+		"local-load",
+		"/var/lib/kubelet/checkpoints/checkpoint-consumer-0-shadow.tar",
+		"app",
+		"localhost/checkpoint/app:recheckpoint",
+	}
+	if len(args) != 4 || args[0] != expectedArgs[0] || args[1] != expectedArgs[1] || args[2] != expectedArgs[2] || args[3] != expectedArgs[3] {
+		t.Errorf("expected args %v, got %v", expectedArgs, args)
+	}
+	// Verify it uses ms2m-agent image, not checkpoint-transfer
+	if job.Spec.Template.Spec.Containers[0].Image != "localhost/ms2m-agent:latest" {
+		t.Errorf("expected ms2m-agent image, got %q", job.Spec.Template.Spec.Containers[0].Image)
 	}
 
 	// Simulate job completion
@@ -3537,7 +3547,6 @@ func TestReconcile_Finalizing_Swap_CreateReplacement(t *testing.T) {
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
 	migration.Spec.TargetNode = "node-2"
-	migration.Spec.TransferMode = "Direct"
 	migration.Status.TargetPod = "consumer-0-shadow"
 	migration.Status.SourceNode = "node-1"
 	migration.Status.StatefulSetName = "consumer"

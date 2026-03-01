@@ -101,7 +101,57 @@ func (h *checkpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "checkpoint loaded successfully")
 }
 
+// localLoad builds an OCI image from a checkpoint tar and loads it directly
+// into the node's containers-storage via skopeo. No network transfer needed.
+func localLoad(tarPath, containerName, imageTag string) error {
+	fmt.Printf("Local load: building OCI image from %s\n", tarPath)
+
+	img, err := checkpoint.BuildCheckpointImage(tarPath, containerName)
+	if err != nil {
+		return fmt.Errorf("build image: %w", err)
+	}
+
+	layoutDir, err := os.MkdirTemp("", "swap-oci-*")
+	if err != nil {
+		return fmt.Errorf("mkdirtemp: %w", err)
+	}
+	defer os.RemoveAll(layoutDir)
+
+	p, err := layout.Write(layoutDir, empty.Index)
+	if err != nil {
+		return fmt.Errorf("write layout: %w", err)
+	}
+
+	if err := p.AppendImage(img); err != nil {
+		return fmt.Errorf("append image: %w", err)
+	}
+
+	cmd := exec.Command("skopeo", "copy",
+		"oci:"+layoutDir,
+		"containers-storage:"+imageTag)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("skopeo copy: %v: %s", err, output)
+	}
+
+	fmt.Printf("Loaded image into containers-storage: %s\n", imageTag)
+	return nil
+}
+
 func main() {
+	// CLI mode: ms2m-agent local-load <tar-path> <container-name> <image-tag>
+	if len(os.Args) > 1 && os.Args[1] == "local-load" {
+		if len(os.Args) != 5 {
+			fmt.Fprintf(os.Stderr, "usage: ms2m-agent local-load <checkpoint-tar> <container-name> <image-tag>\n")
+			os.Exit(1)
+		}
+		if err := localLoad(os.Args[2], os.Args[3], os.Args[4]); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	storageDir := os.Getenv("STORAGE_DIR")
 	if storageDir == "" {
 		storageDir = "/var/lib/ms2m/incoming"
