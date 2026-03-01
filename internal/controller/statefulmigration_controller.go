@@ -980,9 +980,48 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 	return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
 }
 
-// handleSwapMiniReplay drains the swap queue into the replacement pod.
+// handleSwapMiniReplay sends START_REPLAY to the replacement pod and monitors
+// the swap queue depth. Once drained, transitions to TrafficSwitch.
 func (r *StatefulMigrationReconciler) handleSwapMiniReplay(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
-	// TODO: implement in next task
+	logger := log.FromContext(ctx)
+	ensurePhaseTimings(m)
+
+	swapQueue := m.Spec.MessageQueueConfig.QueueName + ".ms2m-replay"
+
+	// Send START_REPLAY on first entry (track with a phase timing key)
+	if _, ok := m.Status.PhaseTimings["Swap.MiniReplay.start"]; !ok {
+		patch := client.MergeFrom(m.DeepCopy())
+		m.Status.PhaseTimings["Swap.MiniReplay.start"] = time.Now().Format(time.RFC3339)
+
+		payload := map[string]interface{}{
+			"queue": swapQueue,
+		}
+		if err := r.MsgClient.SendControlMessage(ctx, m.Status.ReplacementPod, messaging.ControlStartReplay, payload); err != nil {
+			return ctrl.Result{}, false, fmt.Errorf("send START_REPLAY to replacement: %w", err)
+		}
+		_ = r.Status().Patch(ctx, m, patch)
+	}
+
+	// Poll the swap queue depth
+	depth, err := r.MsgClient.GetQueueDepth(ctx, swapQueue)
+	if err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("get swap queue depth: %w", err)
+	}
+
+	logger.Info("Swap replay queue depth", "queue", swapQueue, "depth", depth)
+
+	if depth == 0 {
+		// Queue drained — transition to TrafficSwitch
+		patch := client.MergeFrom(m.DeepCopy())
+		delete(m.Status.PhaseTimings, "Swap.MiniReplay.start")
+		m.Status.SwapSubPhase = "TrafficSwitch"
+		if err := r.Status().Patch(ctx, m, patch); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{Requeue: true}, false, nil
+	}
+
+	// Still draining
 	return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
 }
 

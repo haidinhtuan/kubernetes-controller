@@ -3582,3 +3582,81 @@ func TestReconcile_Finalizing_Swap_CreateReplacement(t *testing.T) {
 		t.Errorf("expected ReplacementPod 'consumer-0', got %q", got.Status.ReplacementPod)
 	}
 }
+
+func TestReconcile_Finalizing_Swap_MiniReplay_Drained(t *testing.T) {
+	migration := newMigration("mig-swap-replay", migrationv1alpha1.PhaseFinalizing)
+	migration.Spec.SourcePod = "consumer-0"
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Status.TargetPod = "consumer-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.StatefulSetName = "consumer"
+	migration.Status.ContainerName = "app"
+	migration.Status.SwapSubPhase = "MiniReplay"
+	migration.Status.ReplacementPod = "consumer-0"
+	migration.Status.PhaseTimings = map[string]string{}
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+	// Swap queue is empty — replay is complete
+	mockBroker.SetQueueDepth("orders.ms2m-replay", 0)
+
+	_, err := reconcileOnce(r, ctx, "mig-swap-replay", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-swap-replay", "default")
+
+	// Should advance to TrafficSwitch
+	if got.Status.SwapSubPhase != "TrafficSwitch" {
+		t.Errorf("expected SwapSubPhase %q, got %q", "TrafficSwitch", got.Status.SwapSubPhase)
+	}
+
+	// Should have sent START_REPLAY to replacement pod
+	found := false
+	for _, msg := range mockBroker.ControlMessages {
+		if msg.TargetPod == "consumer-0" && msg.Type == messaging.ControlStartReplay {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected START_REPLAY control message to replacement pod 'consumer-0'")
+	}
+}
+
+func TestReconcile_Finalizing_Swap_MiniReplay_Pending(t *testing.T) {
+	migration := newMigration("mig-swap-replay-pending", migrationv1alpha1.PhaseFinalizing)
+	migration.Spec.SourcePod = "consumer-0"
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Status.TargetPod = "consumer-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.StatefulSetName = "consumer"
+	migration.Status.ContainerName = "app"
+	migration.Status.SwapSubPhase = "MiniReplay"
+	migration.Status.ReplacementPod = "consumer-0"
+	migration.Status.PhaseTimings = map[string]string{
+		"Swap.MiniReplay.start": time.Now().Format(time.RFC3339),
+	}
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+	// Queue still has messages
+	mockBroker.SetQueueDepth("orders.ms2m-replay", 5)
+
+	result, err := reconcileOnce(r, ctx, "mig-swap-replay-pending", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-swap-replay-pending", "default")
+
+	// Should stay in MiniReplay
+	if got.Status.SwapSubPhase != "MiniReplay" {
+		t.Errorf("expected SwapSubPhase %q, got %q", "MiniReplay", got.Status.SwapSubPhase)
+	}
+
+	// Should requeue with delay
+	if result.RequeueAfter == 0 {
+		t.Error("expected RequeueAfter > 0 while queue not drained")
+	}
+}
