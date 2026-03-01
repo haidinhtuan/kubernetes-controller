@@ -1092,8 +1092,18 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 			}
 		}
 
-		// Wait for the StatefulSet controller to delete the original pod
-		logger.Info("Waiting for original pod to be removed by StatefulSet controller", "pod", replacementName, "node", existing.Spec.NodeName)
+		// Force-delete the original pod with a short grace period.
+		// Its state is already re-checkpointed, so graceful shutdown
+		// adds no value and the default 30s grace period dominates
+		// the identity swap duration.
+		gracePeriod := int64(1)
+		if delErr := r.Delete(ctx, existing, &client.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		}); delErr != nil && !errors.IsNotFound(delErr) {
+			logger.Error(delErr, "Failed to force-delete original pod", "pod", replacementName)
+		}
+
+		logger.Info("Waiting for original pod to terminate", "pod", replacementName, "node", existing.Spec.NodeName)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, false, nil
 	}
 	if !errors.IsNotFound(err) {
