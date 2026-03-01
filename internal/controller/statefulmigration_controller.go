@@ -1025,10 +1025,62 @@ func (r *StatefulMigrationReconciler) handleSwapMiniReplay(ctx context.Context, 
 	return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
 }
 
-// handleSwapTrafficSwitch deletes the shadow pod and scales up the StatefulSet for adoption.
+// handleSwapTrafficSwitch deletes the shadow pod, sends END_REPLAY to the
+// replacement, scales up the StatefulSet for adoption, and cleans up the swap queue.
 func (r *StatefulMigrationReconciler) handleSwapTrafficSwitch(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
-	// TODO: implement in next task
-	return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
+	logger := log.FromContext(ctx)
+
+	// Send END_REPLAY to the replacement pod
+	if err := r.MsgClient.SendControlMessage(ctx, m.Status.ReplacementPod, messaging.ControlEndReplay, nil); err != nil {
+		logger.Error(err, "Failed to send END_REPLAY to replacement pod, continuing anyway")
+	}
+
+	// Delete the swap secondary queue
+	swapQueue := m.Spec.MessageQueueConfig.QueueName + ".ms2m-replay"
+	if err := r.MsgClient.DeleteSecondaryQueue(ctx, swapQueue, m.Spec.MessageQueueConfig.QueueName, m.Spec.MessageQueueConfig.ExchangeName); err != nil {
+		logger.Error(err, "Failed to delete swap queue, continuing anyway")
+	}
+
+	// Delete the shadow pod
+	shadowPod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: m.Status.TargetPod, Namespace: m.Namespace}, shadowPod); err == nil {
+		if err := r.Delete(ctx, shadowPod); err != nil {
+			logger.Error(err, "Failed to delete shadow pod", "pod", m.Status.TargetPod)
+		} else {
+			logger.Info("Deleted shadow pod", "pod", m.Status.TargetPod)
+		}
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, false, err
+	}
+
+	// Scale up StatefulSet to original replica count for adoption
+	if m.Status.OriginalReplicas > 0 {
+		sts := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts); err == nil {
+			if sts.Spec.Replicas == nil || *sts.Spec.Replicas < m.Status.OriginalReplicas {
+				stsPatch := client.MergeFrom(sts.DeepCopy())
+				sts.Spec.Replicas = &m.Status.OriginalReplicas
+				if err := r.Patch(ctx, sts, stsPatch); err != nil {
+					logger.Error(err, "Failed to scale up StatefulSet", "statefulset", m.Status.StatefulSetName)
+				} else {
+					logger.Info("Scaled up StatefulSet for adoption", "statefulset", m.Status.StatefulSetName, "replicas", m.Status.OriginalReplicas)
+				}
+			}
+		} else if !errors.IsNotFound(err) {
+			return ctrl.Result{}, false, err
+		}
+	}
+
+	// Update the TargetPod to point to the replacement (it's the final pod)
+	patch := client.MergeFrom(m.DeepCopy())
+	m.Status.TargetPod = m.Status.ReplacementPod
+	m.Status.SwapSubPhase = ""
+	if err := r.Status().Patch(ctx, m, patch); err != nil {
+		return ctrl.Result{}, false, err
+	}
+
+	logger.Info("TrafficSwitch complete, identity swap finished", "replacementPod", m.Status.ReplacementPod)
+	return ctrl.Result{}, true, nil
 }
 
 // ---------------------------------------------------------------------------

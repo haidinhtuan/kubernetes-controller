@@ -3409,17 +3409,10 @@ func TestReconcile_Finalizing_ShadowPod_StatefulSet_EntersSwap(t *testing.T) {
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 
-	sourcePod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "consumer-0",
-			Namespace: "default",
-		},
-		Spec: corev1.PodSpec{
-			NodeName:   "node-1",
-			Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}},
-		},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning},
-	}
+	// NOTE: source pod "consumer-0" intentionally NOT created — if it existed
+	// and were Running, CreateReplacement would treat it as the replacement pod
+	// and the phase-chaining loop would drive through all sub-phases in one call.
+	// Without it, the chain breaks at CreateReplacement (pod not Running).
 
 	migration := newMigration("mig-swap", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
@@ -3430,7 +3423,7 @@ func TestReconcile_Finalizing_ShadowPod_StatefulSet_EntersSwap(t *testing.T) {
 	migration.Status.ContainerName = "app"
 	migration.Status.PhaseTimings = map[string]string{}
 
-	r, mockBroker, ctx := setupTest(migration, sts, sourcePod, shadowPod)
+	r, mockBroker, ctx := setupTest(migration, sts, shadowPod)
 	mockBroker.Connected = true
 
 	result, err := reconcileOnce(r, ctx, "mig-swap", "default")
@@ -3607,12 +3600,15 @@ func TestReconcile_Finalizing_Swap_MiniReplay_Drained(t *testing.T) {
 
 	got := fetchMigration(r, ctx, "mig-swap-replay", "default")
 
-	// Should advance to TrafficSwitch
-	if got.Status.SwapSubPhase != "TrafficSwitch" {
-		t.Errorf("expected SwapSubPhase %q, got %q", "TrafficSwitch", got.Status.SwapSubPhase)
+	// Phase chaining drives MiniReplay → TrafficSwitch → Completed in one call
+	if got.Status.Phase != migrationv1alpha1.PhaseCompleted {
+		t.Errorf("expected Phase %q after full chain, got %q", migrationv1alpha1.PhaseCompleted, got.Status.Phase)
+	}
+	if got.Status.SwapSubPhase != "" {
+		t.Errorf("expected SwapSubPhase cleared after TrafficSwitch, got %q", got.Status.SwapSubPhase)
 	}
 
-	// Should have sent START_REPLAY to replacement pod
+	// MiniReplay should have sent START_REPLAY to replacement pod
 	found := false
 	for _, msg := range mockBroker.ControlMessages {
 		if msg.TargetPod == "consumer-0" && msg.Type == messaging.ControlStartReplay {
@@ -3658,5 +3654,108 @@ func TestReconcile_Finalizing_Swap_MiniReplay_Pending(t *testing.T) {
 	// Should requeue with delay
 	if result.RequeueAfter == 0 {
 		t.Error("expected RequeueAfter > 0 while queue not drained")
+	}
+}
+
+func TestReconcile_Finalizing_Swap_TrafficSwitch(t *testing.T) {
+	stsReplicas := int32(0)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer",
+			Namespace: "default",
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &stsReplicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "consumer"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "consumer"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}}},
+			},
+		},
+	}
+
+	shadowPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer-0-shadow",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-2",
+			Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer-0",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "consumer"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-2",
+			Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	migration := newMigration("mig-swap-switch", migrationv1alpha1.PhaseFinalizing)
+	migration.Spec.SourcePod = "consumer-0"
+	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Status.TargetPod = "consumer-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Status.StatefulSetName = "consumer"
+	migration.Status.ContainerName = "app"
+	migration.Status.SwapSubPhase = "TrafficSwitch"
+	migration.Status.ReplacementPod = "consumer-0"
+	migration.Status.OriginalReplicas = 1
+	migration.Status.PhaseTimings = map[string]string{}
+
+	r, mockBroker, ctx := setupTest(migration, sts, shadowPod, replacementPod)
+	mockBroker.Connected = true
+
+	_, err := reconcileOnce(r, ctx, "mig-swap-switch", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-swap-switch", "default")
+
+	// Migration should complete
+	if got.Status.Phase != migrationv1alpha1.PhaseCompleted {
+		t.Errorf("expected phase %q, got %q", migrationv1alpha1.PhaseCompleted, got.Status.Phase)
+	}
+
+	// SwapSubPhase should be cleared
+	if got.Status.SwapSubPhase != "" {
+		t.Errorf("expected SwapSubPhase cleared, got %q", got.Status.SwapSubPhase)
+	}
+
+	// Shadow pod should be deleted
+	deletedPod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "consumer-0-shadow", Namespace: "default"}, deletedPod); !errors.IsNotFound(err) {
+		t.Error("expected shadow pod to be deleted")
+	}
+
+	// StatefulSet should be scaled back to original replicas
+	updatedSts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "consumer", Namespace: "default"}, updatedSts); err != nil {
+		t.Fatalf("failed to get StatefulSet: %v", err)
+	}
+	if *updatedSts.Spec.Replicas != 1 {
+		t.Errorf("expected StatefulSet replicas 1, got %d", *updatedSts.Spec.Replicas)
+	}
+
+	// END_REPLAY should have been sent to replacement pod
+	found := false
+	for _, msg := range mockBroker.ControlMessages {
+		if msg.TargetPod == "consumer-0" && msg.Type == messaging.ControlEndReplay {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected END_REPLAY control message to replacement pod 'consumer-0'")
 	}
 }
