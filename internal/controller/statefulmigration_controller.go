@@ -1302,10 +1302,23 @@ func (r *StatefulMigrationReconciler) handleSwapMiniReplay(ctx context.Context, 
 		return ctrl.Result{}, false, fmt.Errorf("get swap queue depth: %w", err)
 	}
 
-	logger.Info("Swap replay queue depth", "queue", swapQueue, "depth", depth)
+	// Use the same cutoff as the main Replaying phase to avoid infinite
+	// draining when the incoming message rate exceeds consumer throughput.
+	cutoff := time.Duration(m.Spec.ReplayCutoffSeconds) * time.Second
+	var elapsed time.Duration
+	if startStr, ok := m.Status.PhaseTimings["Swap.MiniReplay.start"]; ok {
+		if startTime, parseErr := time.Parse(time.RFC3339, startStr); parseErr == nil {
+			elapsed = time.Since(startTime)
+		}
+	}
 
-	if depth == 0 {
-		// Queue drained — transition to TrafficSwitch
+	logger.Info("Swap replay queue depth", "queue", swapQueue, "depth", depth, "elapsed", elapsed.Round(time.Millisecond))
+
+	if depth == 0 || elapsed > cutoff {
+		if depth > 0 {
+			logger.Info("MiniReplay cutoff reached, proceeding with remaining messages", "depth", depth, "elapsed", elapsed)
+		}
+		// Queue drained or cutoff — transition to TrafficSwitch
 		patch := client.MergeFrom(m.DeepCopy())
 		delete(m.Status.PhaseTimings, "Swap.MiniReplay.start")
 		m.Status.SwapSubPhase = "TrafficSwitch"
