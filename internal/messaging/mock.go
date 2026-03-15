@@ -117,6 +117,53 @@ func (m *MockBrokerClient) SendControlMessage(_ context.Context, targetPod strin
 	return nil
 }
 
+func (m *MockBrokerClient) BindQueue(_ context.Context, _, _, _ string) error {
+	return nil
+}
+
+func (m *MockBrokerClient) PurgeQueue(_ context.Context, queueName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.Queues[queueName] = 0
+	return nil
+}
+
+func (m *MockBrokerClient) GetQueueStats(_ context.Context, queueName string) (int, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.DepthErr != nil {
+		return 0, 0, m.DepthErr
+	}
+
+	return m.Queues[queueName], 0, nil
+}
+
+func (m *MockBrokerClient) DeclareAndBindQueue(_ context.Context, queueName, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.CreateQueueErr != nil {
+		return m.CreateQueueErr
+	}
+	if _, exists := m.Queues[queueName]; !exists {
+		m.Queues[queueName] = 0
+	}
+	return nil
+}
+
+func (m *MockBrokerClient) DeleteQueue(_ context.Context, queueName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.DeleteQueueErr != nil {
+		return m.DeleteQueueErr
+	}
+	delete(m.Queues, queueName)
+	return nil
+}
+
 // SetQueueDepth is a test helper that sets the message count for a queue.
 func (m *MockBrokerClient) SetQueueDepth(queue string, depth int) {
 	m.mu.Lock()

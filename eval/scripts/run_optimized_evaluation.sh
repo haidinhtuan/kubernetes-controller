@@ -4,9 +4,14 @@ set -euo pipefail
 # Configuration: which optimized setup to evaluate
 CONFIGURATION="${CONFIGURATION:-deployment-registry}"
 # Options:
-#   "statefulset-sequential" — baseline (uses consumer.yaml StatefulSet)
-#   "deployment-registry"    — Deployment + ShadowPod + Registry transfer
-#   "deployment-direct"      — Deployment + ShadowPod + Direct transfer
+#   "statefulset-sequential"    — baseline (uses consumer.yaml StatefulSet)
+#   "statefulset-shadowpod"     — StatefulSet + ShadowPod (no identity swap)
+#   "statefulset-shadowpod-swap" — StatefulSet + ShadowPod + ExchangeFence identity swap
+#   "deployment-registry"       — Deployment + ShadowPod + Registry transfer
+#   "deployment-direct"         — Deployment + ShadowPod + Direct transfer
+
+# Identity swap mode override (default: auto-detected from configuration name)
+IDENTITY_SWAP_MODE="${IDENTITY_SWAP_MODE:-}"
 
 # Evaluation parameters (matching dissertation methodology)
 MSG_RATES=(10 20 40 60 80 100 120)
@@ -82,10 +87,21 @@ for rate in "${MSG_RATES[@]}"; do
             TRANSFER_MODE_FIELD=""
         fi
 
-        if [[ "$CONFIGURATION" == statefulset-* ]]; then
+        if [[ "$CONFIGURATION" == "statefulset-sequential" ]]; then
             STRATEGY_FIELD=""
+        elif [[ "$CONFIGURATION" == statefulset-* ]]; then
+            STRATEGY_FIELD="  migrationStrategy: ShadowPod"
         else
             STRATEGY_FIELD="  migrationStrategy: ShadowPod"
+        fi
+
+        # Identity swap mode
+        if [[ -n "$IDENTITY_SWAP_MODE" ]]; then
+            SWAP_MODE_FIELD="  identitySwapMode: $IDENTITY_SWAP_MODE"
+        elif [[ "$CONFIGURATION" == "statefulset-shadowpod-swap" ]]; then
+            SWAP_MODE_FIELD="  identitySwapMode: ExchangeFence"
+        else
+            SWAP_MODE_FIELD=""
         fi
 
         # Purge queues to prevent message accumulation between runs
@@ -106,6 +122,7 @@ spec:
   replayCutoffSeconds: 120
 ${STRATEGY_FIELD}
 ${TRANSFER_MODE_FIELD}
+${SWAP_MODE_FIELD}
   messageQueueConfig:
     queueName: app.events
     brokerUrl: amqp://guest:guest@rabbitmq.rabbitmq.svc.cluster.local:5672/
@@ -149,8 +166,20 @@ YAML
         kubectl delete statefulmigration "$MIGRATION_NAME" -n "$NAMESPACE" --ignore-not-found
 
         # Wait for consumer to be ready for next run
-        if [[ "$CONFIGURATION" == statefulset-* ]]; then
-            # StatefulSet: wait for old pod termination, then recreation and readiness
+        if [[ "$CONFIGURATION" == "statefulset-shadowpod" || "$CONFIGURATION" == "statefulset-shadowpod-swap" ]]; then
+            # ShadowPod on StatefulSet: identity swap restores consumer-0,
+            # but if it failed or was cleaned up, ensure StatefulSet is scaled back.
+            echo -n "    Scaling StatefulSet back..."
+            kubectl scale statefulset consumer --replicas=1 -n "$NAMESPACE" 2>/dev/null || true
+            for i in $(seq 1 60); do
+                if kubectl get pod consumer-0 -n "$NAMESPACE" &>/dev/null; then break; fi
+                sleep 2; echo -n "."
+            done
+            kubectl wait --for=condition=Ready pod/consumer-0 -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
+            sleep 5
+            echo " ready"
+        elif [[ "$CONFIGURATION" == statefulset-* ]]; then
+            # StatefulSet sequential: wait for old pod termination, then recreation and readiness
             echo -n "    Waiting for consumer-0 readiness..."
             # Wait for old pod to fully terminate (owned by deleted CR)
             for i in $(seq 1 60); do

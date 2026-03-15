@@ -46,6 +46,10 @@ spec:
           state = {"processed": 0, "last_seq": -1}
           # MS2M replay state
           replay_state = {"active": False, "queue": None}
+          # Restore mode: after CRIU restore, block primary consumption until
+          # START_REPLAY is received. Detected by MS2M_RESTORE_MODE env var
+          # (set by the checkpoint restore image) or control message.
+          restore_mode = os.environ.get('MS2M_RESTORE_MODE', '') == 'true'
 
           class Handler(BaseHTTPRequestHandler):
               def do_GET(self):
@@ -61,6 +65,7 @@ spec:
 
           def check_control_messages(ch, ctrl_queue):
               """Drain pending control messages from the control queue."""
+              global restore_mode
               while True:
                   method, props, body = ch.basic_get(queue=ctrl_queue, auto_ack=True)
                   if method is None:
@@ -69,6 +74,7 @@ spec:
                       msg = json.loads(body)
                       msg_type = msg.get('type', '')
                       if msg_type == 'START_REPLAY':
+                          restore_mode = False  # Exit restore mode
                           replay_state['active'] = True
                           replay_state['queue'] = msg.get('payload', {}).get('queue')
                           print(f"MS2M: START_REPLAY received, switching to {replay_state['queue']}", flush=True)
@@ -97,6 +103,15 @@ spec:
                       # Declare and check control queue for pending messages
                       ch.queue_declare(queue=ctrl_queue, durable=True)
                       check_control_messages(ch, ctrl_queue)
+
+                      # In restore mode, wait for START_REPLAY before consuming.
+                      # This prevents auto-reconnecting to primary after CRIU restore.
+                      if restore_mode:
+                          print(f"MS2M: restore mode — waiting for START_REPLAY on {ctrl_queue}", flush=True)
+                          while restore_mode:
+                              conn.process_data_events(time_limit=1)
+                              check_control_messages(ch, ctrl_queue)
+                          print(f"MS2M: restore mode exited, START_REPLAY received", flush=True)
 
                       # Determine which queue to consume from
                       consume_queue = replay_state['queue'] if replay_state['active'] else primary_queue
@@ -128,6 +143,8 @@ spec:
                           # If replay state changed, switch queues
                           if replay_state['active'] != old_active or replay_state.get('queue') != old_queue:
                               ch.basic_cancel(consumer_tag)
+                              # Drain prefetch buffer: process any in-flight messages
+                              conn.process_data_events(time_limit=0.5)
                               new_queue = replay_state['queue'] if replay_state['active'] else primary_queue
                               ch.queue_declare(queue=new_queue, durable=True)
                               consumer_tag = ch.basic_consume(queue=new_queue, on_message_callback=callback)

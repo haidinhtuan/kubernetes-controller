@@ -48,4 +48,24 @@ type BrokerClient interface {
 	// SendControlMessage publishes a control message to a pod-specific
 	// queue (ms2m.control.<targetPod>).
 	SendControlMessage(ctx context.Context, targetPod string, msgType ControlMessageType, payload map[string]interface{}) error
+
+	// BindQueue binds a queue to an exchange. Used by Exchange-Fence to
+	// rebind the primary queue after the fence cutover.
+	BindQueue(ctx context.Context, queueName, exchangeName, routingKey string) error
+
+	// PurgeQueue removes all messages from a queue.
+	PurgeQueue(ctx context.Context, queueName string) error
+
+	// GetQueueStats returns messages_ready and messages_unacknowledged
+	// separately. Used by Exchange-Fence to verify a queue is fully
+	// drained (both counters at zero) before cutover.
+	GetQueueStats(ctx context.Context, queueName string) (ready int, unacked int, err error)
+
+	// DeclareAndBindQueue creates a durable queue and binds it to the
+	// given exchange. Used by Exchange-Fence to create the buffer queue.
+	DeclareAndBindQueue(ctx context.Context, queueName, exchangeName string) error
+
+	// DeleteQueue removes a queue. Used for cleanup of temporary queues
+	// like the fence buffer queue.
+	DeleteQueue(ctx context.Context, queueName string) error
 }

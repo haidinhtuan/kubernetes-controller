@@ -4,10 +4,11 @@ set -euo pipefail
 # =============================================================================
 # Master Evaluation Script
 #
-# Runs all 3 migration configurations sequentially:
-#   1. statefulset-sequential  (baseline)
-#   2. deployment-registry     (Deployment + ShadowPod + Registry transfer)
-#   3. deployment-direct       (Deployment + ShadowPod + Direct transfer)
+# Runs all 4 migration configurations sequentially:
+#   1. statefulset-sequential    (baseline)
+#   2. statefulset-shadowpod-swap (StatefulSet + ShadowPod + ExchangeFence identity swap)
+#   3. deployment-registry       (Deployment + ShadowPod + Registry transfer)
+#   4. deployment-direct         (Deployment + ShadowPod + Direct transfer)
 #
 # Each configuration deploys its consumer workload, runs the evaluation,
 # then cleans up before switching.
@@ -32,7 +33,7 @@ WORKER_2="${WORKER_2:-worker-2}"
 CONSUMER_SS="$PROJECT_ROOT/eval/workloads/consumer.yaml"
 CONSUMER_DEPLOY="$PROJECT_ROOT/eval/workloads/consumer-deployment.yaml"
 
-CONFIGURATIONS=("statefulset-sequential" "deployment-registry" "deployment-direct")
+CONFIGURATIONS=("statefulset-sequential" "statefulset-shadowpod-swap" "deployment-registry" "deployment-direct")
 
 echo "============================================="
 echo "  MS2M Full Evaluation Suite"
@@ -53,8 +54,9 @@ for config in "${CONFIGURATIONS[@]}"; do
 
     # Deploy the right consumer workload
     case "$config" in
-        statefulset-sequential)
+        statefulset-*)
             echo "Deploying StatefulSet consumer..."
+            kubectl delete -n "$NAMESPACE" -f "$CONSUMER_DEPLOY" --ignore-not-found 2>/dev/null || true
             kubectl apply -n "$NAMESPACE" -f "$CONSUMER_SS"
             echo "Waiting for consumer-0 to be ready..."
             sleep 15
@@ -62,6 +64,7 @@ for config in "${CONFIGURATIONS[@]}"; do
             ;;
         deployment-*)
             echo "Deploying Deployment consumer..."
+            kubectl delete -n "$NAMESPACE" -f "$CONSUMER_SS" --ignore-not-found 2>/dev/null || true
             kubectl apply -n "$NAMESPACE" -f "$CONSUMER_DEPLOY"
             kubectl -n "$NAMESPACE" rollout status deployment/consumer --timeout=120s
             sleep 10
@@ -76,27 +79,32 @@ for config in "${CONFIGURATIONS[@]}"; do
         bash "$SCRIPT_DIR/run_optimized_evaluation.sh"
 
     # Cleanup consumer workload before switching
+    # Determine next config to decide if we can skip cleanup
+    NEXT_CONFIG=""
+    found=false
+    for c in "${CONFIGURATIONS[@]}"; do
+        if [[ "$found" == "true" ]]; then
+            NEXT_CONFIG="$c"
+            break
+        fi
+        if [[ "$c" == "$config" ]]; then
+            found=true
+        fi
+    done
+
     echo ""
     echo "Cleaning up $config consumer..."
     case "$config" in
-        statefulset-sequential)
-            kubectl delete -n "$NAMESPACE" -f "$CONSUMER_SS" --ignore-not-found --wait=true
-            sleep 10
+        statefulset-*)
+            # Keep StatefulSet if next config also uses it
+            if [[ "$NEXT_CONFIG" == statefulset-* ]]; then
+                echo "  Keeping StatefulSet consumer for next config."
+            else
+                kubectl delete -n "$NAMESPACE" -f "$CONSUMER_SS" --ignore-not-found --wait=true
+                sleep 10
+            fi
             ;;
         deployment-*)
-            # Only clean up if next config is not also deployment-based
-            NEXT_CONFIG=""
-            found=false
-            for c in "${CONFIGURATIONS[@]}"; do
-                if [[ "$found" == "true" ]]; then
-                    NEXT_CONFIG="$c"
-                    break
-                fi
-                if [[ "$c" == "$config" ]]; then
-                    found=true
-                fi
-            done
-
             if [[ -z "$NEXT_CONFIG" || "$NEXT_CONFIG" == statefulset-* ]]; then
                 kubectl delete -n "$NAMESPACE" -f "$CONSUMER_DEPLOY" --ignore-not-found --wait=true
                 sleep 10

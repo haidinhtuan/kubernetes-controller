@@ -46,8 +46,17 @@ type StatefulMigrationSpec struct {
 	// CheckpointImageRepository is the registry location to push the checkpoint image
 	CheckpointImageRepository string `json:"checkpointImageRepository,omitempty"`
 
-	// ReplayCutoffSeconds is the threshold in seconds to trigger the final cutoff
+	// ReplayCutoffSeconds is the threshold in seconds to trigger the final cutoff.
+	// Used when ReplayMode is "Cutoff" (the default).
 	ReplayCutoffSeconds int32 `json:"replayCutoffSeconds,omitempty"`
+
+	// ReplayMode controls how the Replaying phase determines completion.
+	// "Cutoff" (default): time-based cutoff using ReplayCutoffSeconds.
+	// The secondary queue remains bound to the exchange during replay.
+	// "Drain": unbind the secondary queue from the exchange so it has a
+	// fixed message set, then wait for full drain. Fails only if the
+	// queue depth stalls (no progress for 30s).
+	ReplayMode string `json:"replayMode,omitempty"`
 
 	// MessageQueueConfig contains details about the messaging system
 	MessageQueueConfig MessageQueueConfig `json:"messageQueueConfig,omitempty"`
@@ -62,6 +71,13 @@ type StatefulMigrationSpec struct {
 	// "Registry" (default): build OCI image, push to registry, target pulls.
 	// "Direct": POST checkpoint tar to ms2m-agent on target node via HTTP.
 	TransferMode string `json:"transferMode,omitempty"`
+
+	// IdentitySwapMode controls how StatefulSet identity is restored during Finalizing.
+	// "None" (default): no identity swap, shadow pod remains orphaned.
+	// "ExchangeFence": full identity swap with Exchange-Fence Convergence for
+	//   zero-gap state synchronization between shadow and replacement pods.
+	// "Cutoff": identity swap with time-based MiniReplay cutoff (15s).
+	IdentitySwapMode string `json:"identitySwapMode,omitempty"`
 }
 
 // StatefulMigrationStatus defines the observed state of StatefulMigration

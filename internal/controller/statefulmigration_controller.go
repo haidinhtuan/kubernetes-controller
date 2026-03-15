@@ -26,6 +26,15 @@ import (
 	"github.com/haidinhtuan/kubernetes-controller/internal/messaging"
 )
 
+// Exchange-Fence protocol constants
+const (
+	preFenceObservationWindow = 3 * time.Second
+	fenceTimeThreshold        = 60.0 // seconds
+	parallelDrainStallTimeout = 30 * time.Second
+	parallelDrainMaxTimeout   = 120 * time.Second
+	parallelDrainPollInterval = 2 * time.Second
+)
+
 // StatefulMigrationReconciler reconciles a StatefulMigration object
 type StatefulMigrationReconciler struct {
 	client.Client
@@ -610,18 +619,35 @@ func (r *StatefulMigrationReconciler) handleRestoring(ctx context.Context, m *mi
 // handleReplaying sends the START_REPLAY control message and monitors the
 // secondary queue depth. Once the queue is drained (or within the cutoff
 // threshold), the migration transitions to the Finalizing phase.
+//
+// Two modes are supported via spec.replayMode:
+//   - "Cutoff" (default): secondary queue stays bound to the exchange.
+//     A time-based cutoff (replayCutoffSeconds) forces finalization.
+//   - "Drain": secondary queue is unbound first (fixed message set).
+//     Waits for full drain; fails only if depth stalls for 30s.
 func (r *StatefulMigrationReconciler) handleReplaying(ctx context.Context, m *migrationv1alpha1.StatefulMigration) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	ensurePhaseTimings(m)
 
+	secondaryQueue := m.Spec.MessageQueueConfig.QueueName + ".ms2m-replay"
+	drainMode := m.Spec.ReplayMode == "Drain"
+
 	// Record phase start time (only on first entry)
 	if _, ok := m.Status.PhaseTimings["Replaying.start"]; !ok {
+		// In Drain mode, unbind the secondary queue first so it has a
+		// fixed message set. No new messages arrive after this point.
+		if drainMode {
+			if err := r.MsgClient.UnbindQueue(ctx, secondaryQueue, m.Spec.MessageQueueConfig.ExchangeName); err != nil {
+				logger.Error(err, "Failed to unbind secondary queue, continuing anyway")
+			}
+		}
+
 		patch := client.MergeFrom(m.DeepCopy())
 		m.Status.PhaseTimings["Replaying.start"] = time.Now().Format(time.RFC3339)
 
 		// Send the START_REPLAY control message on the first pass
 		payload := map[string]interface{}{
-			"queue": m.Spec.MessageQueueConfig.QueueName + ".ms2m-replay",
+			"queue": secondaryQueue,
 		}
 		if err := r.MsgClient.SendControlMessage(ctx, m.Status.TargetPod, messaging.ControlStartReplay, payload); err != nil {
 			return r.failMigration(ctx, m, fmt.Sprintf("send START_REPLAY: %v", err))
@@ -630,7 +656,6 @@ func (r *StatefulMigrationReconciler) handleReplaying(ctx context.Context, m *mi
 	}
 
 	// Poll the secondary queue depth
-	secondaryQueue := m.Spec.MessageQueueConfig.QueueName + ".ms2m-replay"
 	depth, err := r.MsgClient.GetQueueDepth(ctx, secondaryQueue)
 	if err != nil {
 		return r.failMigration(ctx, m, fmt.Sprintf("get queue depth: %v", err))
@@ -648,11 +673,18 @@ func (r *StatefulMigrationReconciler) handleReplaying(ctx context.Context, m *mi
 			}
 			delete(m.Status.PhaseTimings, "Replaying.start")
 		}
+		delete(m.Status.PhaseTimings, "Replaying.lastDepth")
+		delete(m.Status.PhaseTimings, "Replaying.lastDecrease")
 		r.recordPhaseTiming(m, "Replaying", duration)
 		return r.transitionPhase(ctx, m, base, migrationv1alpha1.PhaseFinalizing)
 	}
 
-	// Check if we've exceeded the replay cutoff timeout
+	if drainMode {
+		// Stall detection: fail if queue depth hasn't decreased for 30s.
+		return r.replayDrainCheck(ctx, m, depth)
+	}
+
+	// Cutoff mode: check if we've exceeded the replay cutoff timeout
 	if m.Spec.ReplayCutoffSeconds > 0 {
 		if startStr, ok := m.Status.PhaseTimings["Replaying.start"]; ok {
 			if startTime, parseErr := time.Parse(time.RFC3339, startStr); parseErr == nil {
@@ -672,6 +704,46 @@ func (r *StatefulMigrationReconciler) handleReplaying(ctx context.Context, m *mi
 
 	// Still draining — use exponential backoff
 	return ctrl.Result{RequeueAfter: r.pollingBackoff(m, "Replaying.start")}, nil
+}
+
+// replayDrainCheck implements stall detection for Drain replay mode.
+// It tracks the last observed queue depth and when it last decreased.
+// If the depth hasn't decreased for 30s, the migration fails.
+func (r *StatefulMigrationReconciler) replayDrainCheck(ctx context.Context, m *migrationv1alpha1.StatefulMigration, depth int) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	now := time.Now()
+
+	lastDepthStr := m.Status.PhaseTimings["Replaying.lastDepth"]
+	lastDecreaseStr := m.Status.PhaseTimings["Replaying.lastDecrease"]
+
+	lastDepth := 0
+	if lastDepthStr != "" {
+		fmt.Sscanf(lastDepthStr, "%d", &lastDepth)
+	}
+
+	depthDecreased := lastDepthStr == "" || depth < lastDepth
+
+	patch := client.MergeFrom(m.DeepCopy())
+	m.Status.PhaseTimings["Replaying.lastDepth"] = fmt.Sprintf("%d", depth)
+
+	if depthDecreased {
+		m.Status.PhaseTimings["Replaying.lastDecrease"] = now.Format(time.RFC3339)
+	} else if lastDecreaseStr != "" {
+		// Check stall duration
+		if lastDecrease, parseErr := time.Parse(time.RFC3339, lastDecreaseStr); parseErr == nil {
+			stalled := now.Sub(lastDecrease)
+			if stalled > 30*time.Second {
+				logger.Info("Replay stalled, consumer not making progress",
+					"stalledFor", stalled, "depth", depth)
+				return r.failMigration(ctx, m, fmt.Sprintf("replay stalled: queue depth %d unchanged for %s", depth, stalled.Round(time.Second)))
+			}
+		}
+	}
+
+	_ = r.Status().Patch(ctx, m, patch)
+
+	// Poll every 2s in drain mode (fixed set, no backoff needed)
+	return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 }
 
 // handleFinalizing sends END_REPLAY, tears down the secondary queue, and
@@ -705,10 +777,11 @@ func (r *StatefulMigrationReconciler) handleFinalizing(ctx context.Context, m *m
 	}
 
 	// In ShadowPod strategy, the source pod is still around and needs to be removed.
-	// For StatefulSet-owned pods, perform identity swap to restore StatefulSet ownership.
+	// For StatefulSet-owned pods, perform identity swap if requested via IdentitySwapMode.
 	if m.Spec.MigrationStrategy == "ShadowPod" {
-		if m.Status.StatefulSetName != "" {
-			// ShadowPod + StatefulSet: perform identity swap to restore StatefulSet ownership
+		swapMode := m.Spec.IdentitySwapMode
+		if m.Status.StatefulSetName != "" && swapMode != "" && swapMode != "None" {
+			// ShadowPod + StatefulSet + identity swap enabled
 			result, done, err := r.handleIdentitySwap(ctx, m, base)
 			if err != nil {
 				return result, err
@@ -872,6 +945,15 @@ func (r *StatefulMigrationReconciler) handleIdentitySwap(ctx context.Context, m 
 			result, done, err = r.handleSwapMiniReplay(ctx, m, base)
 		case "TrafficSwitch":
 			result, done, err = r.handleSwapTrafficSwitch(ctx, m, base)
+		// Exchange-Fence sub-phases
+		case "PreFenceDrain":
+			result, done, err = r.handleSwapPreFenceDrain(ctx, m, base)
+		case "ExchangeFence":
+			result, done, err = r.handleSwapExchangeFence(ctx, m, base)
+		case "ParallelDrain":
+			result, done, err = r.handleSwapParallelDrain(ctx, m, base)
+		case "FenceCutover":
+			result, done, err = r.handleSwapFenceCutover(ctx, m, base)
 		default:
 			logger.Error(nil, "Unknown swap sub-phase", "subPhase", m.Status.SwapSubPhase)
 			return ctrl.Result{}, true, nil
@@ -909,6 +991,38 @@ func (r *StatefulMigrationReconciler) handleSwapPrepare(ctx context.Context, m *
 	}
 
 	logger.Info("PrepareSwap complete, swap queue created")
+
+	// Start STS scale-down early so it overlaps with re-checkpoint + transfer.
+	// This saves ~7-15s from the accumulation window (less time for messages
+	// to accumulate in the swap queue).
+	if m.Status.StatefulSetName != "" {
+		sts := &appsv1.StatefulSet{}
+		if stsErr := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts); stsErr == nil {
+			if sts.Spec.Replicas != nil && *sts.Spec.Replicas > 0 {
+				// Save original replicas before scaling down
+				if m.Status.OriginalReplicas == 0 {
+					m.Status.OriginalReplicas = *sts.Spec.Replicas
+				}
+
+				newReplicas := int32(0)
+				stsPatch := client.MergeFrom(sts.DeepCopy())
+				sts.Spec.Replicas = &newReplicas
+
+				// Update nodeSelector so STS generates correct ControllerRevision
+				if sts.Spec.Template.Spec.NodeSelector == nil {
+					sts.Spec.Template.Spec.NodeSelector = make(map[string]string)
+				}
+				sts.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] = m.Spec.TargetNode
+
+				if patchErr := r.Patch(ctx, sts, stsPatch); patchErr != nil {
+					logger.Error(patchErr, "Failed to start early STS scale-down, will retry in CreateReplacement")
+				} else {
+					logger.Info("Started early STS scale-down in PrepareSwap",
+						"statefulset", m.Status.StatefulSetName, "targetNode", m.Spec.TargetNode)
+				}
+			}
+		}
+	}
 
 	// Transition to ReCheckpoint
 	patch := client.MergeFrom(m.DeepCopy())
@@ -1120,7 +1234,12 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 			if existing.Status.Phase == corev1.PodRunning {
 				patch := client.MergeFrom(m.DeepCopy())
 				m.Status.ReplacementPod = replacementName
-				m.Status.SwapSubPhase = "MiniReplay"
+				// Route based on identity swap mode
+				if m.Spec.IdentitySwapMode == "ExchangeFence" {
+					m.Status.SwapSubPhase = "PreFenceDrain"
+				} else {
+					m.Status.SwapSubPhase = "MiniReplay"
+				}
 				if err := r.Status().Patch(ctx, m, patch); err != nil {
 					return ctrl.Result{}, false, err
 				}
@@ -1442,6 +1561,487 @@ func (r *StatefulMigrationReconciler) handleSwapTrafficSwitch(ctx context.Contex
 
 	logger.Info("TrafficSwitch complete, identity swap finished", "replacementPod", m.Status.ReplacementPod)
 	return ctrl.Result{}, true, nil
+}
+
+// ---------------------------------------------------------------------------
+// Exchange-Fence Convergence sub-phases
+// ---------------------------------------------------------------------------
+
+// handleSwapPreFenceDrain starts pre-fence consumption of the swap queue by
+// the replacement pod. It monitors queue depth to measure R_in (publish rate)
+// and R_out (consumption rate), then uses the adaptive decision function to
+// choose Exchange-Fence or fall back to Cutoff (MiniReplay).
+//
+// Adaptive strategy: estimate fence drain time as
+//
+//	T_fence ≈ max(D_swap, D_primary) / R_net   where R_net = R_out - R_in
+//
+// If R_in ≥ R_out (ρ ≥ 1) or T_fence > 60s, fall back to Cutoff.
+func (r *StatefulMigrationReconciler) handleSwapPreFenceDrain(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx)
+	ensurePhaseTimings(m)
+
+	mqCfg := m.Spec.MessageQueueConfig
+	swapQueue := mqCfg.QueueName + ".ms2m-replay"
+
+	// Send START_REPLAY and record initial depth on first entry
+	if _, ok := m.Status.PhaseTimings["Swap.PreFence.start"]; !ok {
+		// Get initial swap queue depth before consumption starts
+		initialDepth, err := r.MsgClient.GetQueueDepth(ctx, swapQueue)
+		if err != nil {
+			return ctrl.Result{}, false, fmt.Errorf("get initial swap depth: %w", err)
+		}
+
+		payload := map[string]interface{}{
+			"queue": swapQueue,
+		}
+		if err := r.MsgClient.SendControlMessage(ctx, m.Status.ReplacementPod, messaging.ControlStartReplay, payload); err != nil {
+			return ctrl.Result{}, false, fmt.Errorf("send START_REPLAY for pre-fence: %w", err)
+		}
+
+		patch := client.MergeFrom(m.DeepCopy())
+		m.Status.PhaseTimings["Swap.PreFence.start"] = time.Now().Format(time.RFC3339)
+		m.Status.PhaseTimings["Swap.PreFence.initialDepth"] = fmt.Sprintf("%d", initialDepth)
+		_ = r.Status().Patch(ctx, m, patch)
+	}
+
+	// Measure current swap queue depth
+	currentDepth, err := r.MsgClient.GetQueueDepth(ctx, swapQueue)
+	if err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("get swap queue depth for pre-fence: %w", err)
+	}
+
+	var elapsed time.Duration
+	if startStr, ok := m.Status.PhaseTimings["Swap.PreFence.start"]; ok {
+		if startTime, parseErr := time.Parse(time.RFC3339, startStr); parseErr == nil {
+			elapsed = time.Since(startTime)
+		}
+	}
+
+	logger.Info("PreFenceDrain status", "queue", swapQueue, "depth", currentDepth, "elapsed", elapsed.Round(time.Millisecond))
+
+	// Wait at least the observation window to collect meaningful rate samples
+	if elapsed < preFenceObservationWindow {
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
+	}
+
+	// Adaptive decision: estimate R_in and R_out from depth change.
+	//
+	// Over the observation window:
+	//   - Consumer removed some messages (R_out × t)
+	//   - Producer added some messages (R_in × t)
+	//   - Net change: currentDepth - initialDepth = (R_in - R_out) × t
+	//   - If depth decreased: R_out > R_in (good for fence)
+	//   - If depth increased: R_in > R_out (fence would take too long)
+	initialDepth := 0
+	if depthStr, ok := m.Status.PhaseTimings["Swap.PreFence.initialDepth"]; ok {
+		fmt.Sscanf(depthStr, "%d", &initialDepth)
+	}
+
+	elapsedSec := elapsed.Seconds()
+	useFence := true
+	var reason string
+
+	if elapsedSec > 0 {
+		// Net drain rate: positive means queue is shrinking
+		netDrainRate := float64(initialDepth-currentDepth) / elapsedSec
+
+		// Also get primary queue depth for fence time estimation
+		primaryDepth, _ := r.MsgClient.GetQueueDepth(ctx, mqCfg.QueueName)
+
+		maxDepth := primaryDepth
+		if currentDepth > maxDepth {
+			maxDepth = currentDepth
+		}
+
+		if netDrainRate <= 0 {
+			// Queue growing or flat: R_in ≥ R_out (ρ ≥ 1)
+			useFence = false
+			reason = fmt.Sprintf("queue not draining (net rate %.1f msg/s)", netDrainRate)
+		} else if maxDepth > 0 {
+			// Estimate fence drain time
+			estimatedFenceTime := float64(maxDepth) / netDrainRate
+			if estimatedFenceTime > fenceTimeThreshold {
+				useFence = false
+				reason = fmt.Sprintf("estimated fence time %.0fs > %.0fs threshold", estimatedFenceTime, fenceTimeThreshold)
+			} else {
+				reason = fmt.Sprintf("estimated fence time %.1fs (net drain %.1f msg/s)", estimatedFenceTime, netDrainRate)
+			}
+		}
+
+		logger.Info("Adaptive decision",
+			"initialDepth", initialDepth, "currentDepth", currentDepth,
+			"primaryDepth", primaryDepth, "netDrainRate", netDrainRate,
+			"useFence", useFence, "reason", reason)
+	}
+
+	patch := client.MergeFrom(m.DeepCopy())
+	delete(m.Status.PhaseTimings, "Swap.PreFence.start")
+	delete(m.Status.PhaseTimings, "Swap.PreFence.initialDepth")
+
+	if useFence {
+		m.Status.SwapSubPhase = "ExchangeFence"
+		logger.Info("Adaptive: proceeding with Exchange-Fence", "reason", reason)
+	} else {
+		// Fall back to Cutoff: unbind swap queue and use MiniReplay.
+		// Set MiniReplay.start so handleSwapMiniReplay skips its init block
+		// (START_REPLAY was already sent and swap queue will be unbound here).
+		if unbindErr := r.MsgClient.UnbindQueue(ctx, swapQueue, mqCfg.ExchangeName); unbindErr != nil {
+			logger.Error(unbindErr, "Failed to unbind swap queue for Cutoff fallback")
+		}
+		m.Status.PhaseTimings["Swap.MiniReplay.start"] = time.Now().Format(time.RFC3339)
+		m.Status.SwapSubPhase = "MiniReplay"
+		logger.Info("Adaptive: falling back to MiniReplay (Cutoff)", "reason", reason)
+	}
+
+	if err := r.Status().Patch(ctx, m, patch); err != nil {
+		return ctrl.Result{}, false, err
+	}
+
+	return ctrl.Result{Requeue: true}, false, nil
+}
+
+// handleSwapExchangeFence performs the atomic topology change:
+// 1. Create and bind a buffer queue to catch post-fence messages
+// 2. Unbind primary queue from exchange (shadow gets no new messages)
+// 3. Unbind swap queue from exchange (replacement gets no new messages)
+// Both queues now have a finite message set to drain.
+func (r *StatefulMigrationReconciler) handleSwapExchangeFence(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx)
+	ensurePhaseTimings(m)
+
+	mqCfg := m.Spec.MessageQueueConfig
+	swapQueue := mqCfg.QueueName + ".ms2m-replay"
+	bufferQueue := mqCfg.QueueName + ".ms2m-fence-buffer"
+
+	// Guard: if fence was already applied (e.g. controller restarted mid-fence),
+	// skip straight to recording depths and transitioning to ParallelDrain.
+	if _, alreadyFenced := m.Status.PhaseTimings["Swap.Fence.time"]; alreadyFenced {
+		logger.Info("Exchange-Fence: fence already applied, skipping to ParallelDrain")
+		patch := client.MergeFrom(m.DeepCopy())
+		m.Status.SwapSubPhase = "ParallelDrain"
+		if err := r.Status().Patch(ctx, m, patch); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{Requeue: true}, false, nil
+	}
+
+	// Get current depths before fence for timeout estimation
+	primaryDepth, err := r.MsgClient.GetQueueDepth(ctx, mqCfg.QueueName)
+	if err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("get primary depth before fence: %w", err)
+	}
+	swapDepth, err := r.MsgClient.GetQueueDepth(ctx, swapQueue)
+	if err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("get swap depth before fence: %w", err)
+	}
+
+	logger.Info("Exchange-Fence: pre-fence depths", "primaryDepth", primaryDepth, "swapDepth", swapDepth)
+
+	// Step 1: Create buffer queue and bind to exchange.
+	// The buffer catches all messages published after the fence.
+	// DeclareAndBindQueue is idempotent in RabbitMQ (safe to re-call).
+	if err := r.MsgClient.DeclareAndBindQueue(ctx, bufferQueue, mqCfg.ExchangeName); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("create buffer queue: %w", err)
+	}
+
+	// Step 2: Unbind primary queue from exchange.
+	// UnbindQueue on an already-unbound queue is a no-op in RabbitMQ.
+	if err := r.MsgClient.UnbindQueue(ctx, mqCfg.QueueName, mqCfg.ExchangeName); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("unbind primary queue for fence: %w", err)
+	}
+
+	// Step 3: Unbind swap queue from exchange
+	if err := r.MsgClient.UnbindQueue(ctx, swapQueue, mqCfg.ExchangeName); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("unbind swap queue for fence: %w", err)
+	}
+
+	logger.Info("Exchange-Fence: topology change complete",
+		"primaryUnbound", mqCfg.QueueName,
+		"swapUnbound", swapQueue,
+		"bufferBound", bufferQueue)
+
+	// Record fence time and depths for parallel drain timeout
+	patch := client.MergeFrom(m.DeepCopy())
+	m.Status.PhaseTimings["Swap.Fence.time"] = time.Now().Format(time.RFC3339)
+	m.Status.PhaseTimings["Swap.Fence.primaryDepth"] = fmt.Sprintf("%d", primaryDepth)
+	m.Status.PhaseTimings["Swap.Fence.swapDepth"] = fmt.Sprintf("%d", swapDepth)
+	m.Status.SwapSubPhase = "ParallelDrain"
+	if err := r.Status().Patch(ctx, m, patch); err != nil {
+		return ctrl.Result{}, false, err
+	}
+
+	return ctrl.Result{Requeue: true}, false, nil
+}
+
+// handleSwapParallelDrain waits for both the shadow (primary queue) and
+// replacement (swap queue) to drain their finite message sets to zero.
+// Uses timeout and stall detection to handle failures.
+func (r *StatefulMigrationReconciler) handleSwapParallelDrain(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx)
+	ensurePhaseTimings(m)
+
+	mqCfg := m.Spec.MessageQueueConfig
+	swapQueue := mqCfg.QueueName + ".ms2m-replay"
+
+	// Get both queue depths (ready + unacked for correctness)
+	primaryReady, primaryUnacked, err := r.MsgClient.GetQueueStats(ctx, mqCfg.QueueName)
+	if err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("get primary queue stats: %w", err)
+	}
+	swapReady, swapUnacked, err := r.MsgClient.GetQueueStats(ctx, swapQueue)
+	if err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("get swap queue stats: %w", err)
+	}
+
+	primaryTotal := primaryReady + primaryUnacked
+	swapTotal := swapReady + swapUnacked
+
+	// Elapsed time since fence
+	var elapsed time.Duration
+	if fenceStr, ok := m.Status.PhaseTimings["Swap.Fence.time"]; ok {
+		if fenceTime, parseErr := time.Parse(time.RFC3339, fenceStr); parseErr == nil {
+			elapsed = time.Since(fenceTime)
+		}
+	}
+
+	logger.Info("ParallelDrain status",
+		"primaryTotal", primaryTotal, "swapTotal", swapTotal,
+		"elapsed", elapsed.Round(time.Millisecond))
+
+	// Both drained — proceed to cutover
+	if primaryTotal == 0 && swapTotal == 0 {
+		logger.Info("ParallelDrain complete — both queues drained")
+		patch := client.MergeFrom(m.DeepCopy())
+		delete(m.Status.PhaseTimings, "Swap.Fence.time")
+		delete(m.Status.PhaseTimings, "Swap.Fence.primaryDepth")
+		delete(m.Status.PhaseTimings, "Swap.Fence.swapDepth")
+		m.Status.SwapSubPhase = "FenceCutover"
+		if err := r.Status().Patch(ctx, m, patch); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{Requeue: true}, false, nil
+	}
+
+	// Stall detection: if depth hasn't changed for the stall timeout, fail the drain
+	lastDepthKey := "Swap.ParallelDrain.lastDepth"
+	lastCheckKey := "Swap.ParallelDrain.lastCheck"
+	currentDepthStr := fmt.Sprintf("%d,%d", primaryTotal, swapTotal)
+
+	if lastDepth, ok := m.Status.PhaseTimings[lastDepthKey]; ok {
+		if lastDepth == currentDepthStr {
+			// Depth hasn't changed — check how long
+			if lastCheckStr, ok2 := m.Status.PhaseTimings[lastCheckKey]; ok2 {
+				if lastCheck, parseErr := time.Parse(time.RFC3339, lastCheckStr); parseErr == nil {
+					if time.Since(lastCheck) > parallelDrainStallTimeout {
+						logger.Error(nil, "ParallelDrain stalled — depth unchanged",
+							"primaryTotal", primaryTotal, "swapTotal", swapTotal)
+						// Clean up stall tracking
+						delete(m.Status.PhaseTimings, lastDepthKey)
+						delete(m.Status.PhaseTimings, lastCheckKey)
+						return r.handleSwapFenceRollback(ctx, m, base, "parallel drain stalled")
+					}
+				}
+			}
+		} else {
+			// Depth changed — reset stall timer
+			patch := client.MergeFrom(m.DeepCopy())
+			m.Status.PhaseTimings[lastDepthKey] = currentDepthStr
+			m.Status.PhaseTimings[lastCheckKey] = time.Now().Format(time.RFC3339)
+			_ = r.Status().Patch(ctx, m, patch)
+		}
+	} else {
+		// First check — initialize stall tracking
+		patch := client.MergeFrom(m.DeepCopy())
+		m.Status.PhaseTimings[lastDepthKey] = currentDepthStr
+		m.Status.PhaseTimings[lastCheckKey] = time.Now().Format(time.RFC3339)
+		_ = r.Status().Patch(ctx, m, patch)
+	}
+
+	// Timeout: max duration for parallel drain
+	if elapsed > parallelDrainMaxTimeout {
+		logger.Error(nil, "ParallelDrain timeout", "elapsed", elapsed)
+		return r.handleSwapFenceRollback(ctx, m, base, "parallel drain timeout")
+	}
+
+	return ctrl.Result{RequeueAfter: parallelDrainPollInterval}, false, nil
+}
+
+// handleSwapFenceCutover completes the Exchange-Fence protocol:
+// 1. Kill shadow pod (it has drained its primary queue)
+// 2. Rebind primary queue to exchange (restore normal routing)
+// 3. Replacement drains buffer queue (post-fence messages)
+// 4. Delete buffer + swap queues, send END_REPLAY
+func (r *StatefulMigrationReconciler) handleSwapFenceCutover(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx)
+	ensurePhaseTimings(m)
+
+	mqCfg := m.Spec.MessageQueueConfig
+	swapQueue := mqCfg.QueueName + ".ms2m-replay"
+	bufferQueue := mqCfg.QueueName + ".ms2m-fence-buffer"
+
+	// Step 1: Kill the shadow pod (it has fully drained primary)
+	shadowPod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: m.Status.TargetPod, Namespace: m.Namespace}, shadowPod); err == nil {
+		gracePeriod := int64(1)
+		if err := r.Delete(ctx, shadowPod, &client.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		}); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete shadow pod during fence cutover", "pod", m.Status.TargetPod)
+		} else {
+			logger.Info("Deleted shadow pod (drained primary)", "pod", m.Status.TargetPod)
+		}
+	}
+
+	// Step 2: Rebind primary queue to exchange (restore normal message flow).
+	// Step 3: Then unbind buffer queue from exchange.
+	// Order matters: rebind-then-unbind means both are briefly bound (possible
+	// duplicates in buffer), but avoids message loss. Unbind-then-rebind would
+	// lose messages published in the gap. At-least-once is preferable.
+	if err := r.MsgClient.BindQueue(ctx, mqCfg.QueueName, mqCfg.ExchangeName, ""); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("rebind primary queue: %w", err)
+	}
+
+	if err := r.MsgClient.UnbindQueue(ctx, bufferQueue, mqCfg.ExchangeName); err != nil {
+		logger.Error(err, "Failed to unbind buffer queue, continuing anyway")
+	}
+
+	// Step 4: Check if buffer queue has messages to drain
+	bufferReady, bufferUnacked, err := r.MsgClient.GetQueueStats(ctx, bufferQueue)
+	if err != nil {
+		// Buffer queue may not exist if fence was fast — not an error
+		logger.Info("Buffer queue not accessible, treating as empty", "err", err)
+		bufferReady, bufferUnacked = 0, 0
+	}
+
+	if bufferReady+bufferUnacked > 0 {
+		// Tell replacement to drain buffer queue before switching to primary
+		if _, ok := m.Status.PhaseTimings["Swap.BufferDrain.start"]; !ok {
+			payload := map[string]interface{}{
+				"queue": bufferQueue,
+			}
+			if err := r.MsgClient.SendControlMessage(ctx, m.Status.ReplacementPod, messaging.ControlStartReplay, payload); err != nil {
+				logger.Error(err, "Failed to send START_REPLAY for buffer drain")
+			}
+			patch := client.MergeFrom(m.DeepCopy())
+			m.Status.PhaseTimings["Swap.BufferDrain.start"] = time.Now().Format(time.RFC3339)
+			_ = r.Status().Patch(ctx, m, patch)
+		}
+
+		// Timeout: buffer queue should be small; fail if draining takes > 30s
+		if startStr, ok := m.Status.PhaseTimings["Swap.BufferDrain.start"]; ok {
+			if startTime, err := time.Parse(time.RFC3339, startStr); err == nil {
+				if time.Since(startTime) > parallelDrainStallTimeout {
+					logger.Error(nil, "Buffer drain timeout — proceeding without full drain",
+						"bufferReady", bufferReady, "bufferUnacked", bufferUnacked)
+					// Don't block forever; proceed to END_REPLAY. Buffer messages
+					// will be lost but the migration can complete.
+				} else {
+					logger.Info("Draining buffer queue", "bufferReady", bufferReady, "bufferUnacked", bufferUnacked)
+					return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
+				}
+			}
+		} else {
+			logger.Info("Draining buffer queue", "bufferReady", bufferReady, "bufferUnacked", bufferUnacked)
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, false, nil
+		}
+	}
+
+	// Buffer drained — send END_REPLAY and clean up
+	if err := r.MsgClient.SendControlMessage(ctx, m.Status.ReplacementPod, messaging.ControlEndReplay, nil); err != nil {
+		logger.Error(err, "Failed to send END_REPLAY to replacement pod")
+	}
+
+	// Delete swap and buffer queues
+	if err := r.MsgClient.DeleteSecondaryQueue(ctx, swapQueue, mqCfg.QueueName, mqCfg.ExchangeName); err != nil {
+		logger.Error(err, "Failed to delete swap queue during fence cleanup")
+	}
+	if err := r.MsgClient.DeleteQueue(ctx, bufferQueue); err != nil {
+		logger.Error(err, "Failed to delete buffer queue during fence cleanup")
+	}
+
+	// Scale up StatefulSet for adoption
+	if m.Status.OriginalReplicas > 0 {
+		sts := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts); err == nil {
+			if sts.Spec.Replicas == nil || *sts.Spec.Replicas < m.Status.OriginalReplicas {
+				stsPatch := client.MergeFrom(sts.DeepCopy())
+				sts.Spec.Replicas = &m.Status.OriginalReplicas
+				if err := r.Patch(ctx, sts, stsPatch); err != nil {
+					logger.Error(err, "Failed to scale up StatefulSet", "statefulset", m.Status.StatefulSetName)
+				}
+			}
+		}
+	}
+
+	// Update TargetPod and clear swap state
+	patch := client.MergeFrom(m.DeepCopy())
+	m.Status.TargetPod = m.Status.ReplacementPod
+	m.Status.SwapSubPhase = ""
+	delete(m.Status.PhaseTimings, "Swap.BufferDrain.start")
+	if err := r.Status().Patch(ctx, m, patch); err != nil {
+		return ctrl.Result{}, false, err
+	}
+
+	logger.Info("FenceCutover complete — Exchange-Fence identity swap finished", "replacementPod", m.Status.ReplacementPod)
+	return ctrl.Result{}, true, nil
+}
+
+// handleSwapFenceRollback is called when the Exchange-Fence fails (stall or
+// timeout during ParallelDrain). It restores normal message routing and falls
+// back to the Cutoff path.
+func (r *StatefulMigrationReconciler) handleSwapFenceRollback(ctx context.Context, m *migrationv1alpha1.StatefulMigration, base client.Object, reason string) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx)
+
+	mqCfg := m.Spec.MessageQueueConfig
+	bufferQueue := mqCfg.QueueName + ".ms2m-fence-buffer"
+	swapQueue := mqCfg.QueueName + ".ms2m-replay"
+
+	logger.Info("Exchange-Fence rollback", "reason", reason)
+
+	// Rebind primary queue to restore live service
+	if err := r.MsgClient.BindQueue(ctx, mqCfg.QueueName, mqCfg.ExchangeName, ""); err != nil {
+		logger.Error(err, "Rollback: failed to rebind primary queue")
+	}
+
+	// Rebind swap queue so replacement can continue receiving
+	if err := r.MsgClient.BindQueue(ctx, swapQueue, mqCfg.ExchangeName, ""); err != nil {
+		logger.Error(err, "Rollback: failed to rebind swap queue")
+	}
+
+	// Clean up buffer queue. Warn if messages accumulated during the fence
+	// window — these will be lost when the buffer is deleted. The primary
+	// queue is now rebound, so new messages flow normally after rollback.
+	if depth, depthErr := r.MsgClient.GetQueueDepth(ctx, bufferQueue); depthErr == nil && depth > 0 {
+		logger.Error(nil, "Rollback: buffer queue has messages that will be lost",
+			"bufferQueue", bufferQueue, "depth", depth)
+	}
+	if err := r.MsgClient.UnbindQueue(ctx, bufferQueue, mqCfg.ExchangeName); err != nil {
+		logger.Error(err, "Rollback: failed to unbind buffer queue")
+	}
+	if err := r.MsgClient.DeleteQueue(ctx, bufferQueue); err != nil {
+		logger.Error(err, "Rollback: failed to delete buffer queue")
+	}
+
+	// Fall back to Cutoff-style MiniReplay. The swap queue was rebound above;
+	// MiniReplay will unbind it again for its drain approach.
+	// Set MiniReplay.start so that handleSwapMiniReplay skips sending a
+	// duplicate START_REPLAY (one was already sent in PreFenceDrain).
+	patch := client.MergeFrom(m.DeepCopy())
+	// Clean up fence tracking state
+	delete(m.Status.PhaseTimings, "Swap.Fence.time")
+	delete(m.Status.PhaseTimings, "Swap.Fence.primaryDepth")
+	delete(m.Status.PhaseTimings, "Swap.Fence.swapDepth")
+	delete(m.Status.PhaseTimings, "Swap.ParallelDrain.lastDepth")
+	delete(m.Status.PhaseTimings, "Swap.ParallelDrain.lastCheck")
+	m.Status.PhaseTimings["Swap.MiniReplay.start"] = time.Now().Format(time.RFC3339)
+	m.Status.SwapSubPhase = "MiniReplay"
+	if err := r.Status().Patch(ctx, m, patch); err != nil {
+		return ctrl.Result{}, false, err
+	}
+
+	logger.Info("Exchange-Fence rolled back, falling back to MiniReplay (Cutoff)")
+	return ctrl.Result{Requeue: true}, false, nil
 }
 
 // ---------------------------------------------------------------------------

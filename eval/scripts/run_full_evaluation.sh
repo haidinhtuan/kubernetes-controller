@@ -8,9 +8,10 @@ set -euo pipefail
 # Includes per-run checkpoint cleanup to prevent disk exhaustion.
 #
 # Configurations:
-#   1. statefulset-sequential  (baseline)
-#   2. statefulset-shadowpod   (ShadowPod on StatefulSet)
-#   3. deployment-registry     (ShadowPod on Deployment)
+#   1. statefulset-sequential    (baseline)
+#   2. statefulset-shadowpod     (ShadowPod on StatefulSet)
+#   3. statefulset-shadowpod-swap (ShadowPod + ExchangeFence identity swap)
+#   4. deployment-registry       (ShadowPod on Deployment)
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,7 +24,7 @@ CHECKPOINT_REPO="${CHECKPOINT_REPO:-registry.registry.svc.cluster.local:5000/che
 CONSUMER_SS="$PROJECT_ROOT/eval/workloads/consumer.yaml"
 CONSUMER_DEPLOY="$PROJECT_ROOT/eval/workloads/consumer-deployment.yaml"
 
-CONFIGURATIONS="${CONFIGURATIONS:-statefulset-sequential statefulset-shadowpod deployment-registry}"
+CONFIGURATIONS="${CONFIGURATIONS:-statefulset-sequential statefulset-shadowpod statefulset-shadowpod-swap deployment-registry}"
 MSG_RATES=(${MSG_RATES:-10 20 40 60 80 100 120})
 REPETITIONS="${REPETITIONS:-10}"
 
@@ -139,6 +140,13 @@ for config in $CONFIGURATIONS; do
                 STRATEGY_FIELD="  migrationStrategy: ShadowPod"
             fi
 
+            # Identity swap mode field
+            if [[ "$config" == "statefulset-shadowpod-swap" ]]; then
+                SWAP_MODE_FIELD="  identitySwapMode: ExchangeFence"
+            else
+                SWAP_MODE_FIELD=""
+            fi
+
             # Purge queues
             kubectl exec -n rabbitmq "$RMQ_POD" -- rabbitmqctl purge_queue app.events 2>/dev/null || true
             kubectl exec -n rabbitmq "$RMQ_POD" -- rabbitmqctl delete_queue app.events.ms2m-replay 2>/dev/null || true
@@ -159,6 +167,7 @@ spec:
   checkpointImageRepository: ${CHECKPOINT_REPO}
   replayCutoffSeconds: 120
 ${STRATEGY_FIELD}
+${SWAP_MODE_FIELD}
   messageQueueConfig:
     queueName: app.events
     brokerUrl: amqp://guest:guest@rabbitmq.rabbitmq.svc.cluster.local:5672/
@@ -204,7 +213,7 @@ YAML
             cleanup_checkpoint_images
 
             # Wait for consumer to be ready for next run
-            if [[ "$config" == "statefulset-shadowpod" ]]; then
+            if [[ "$config" == "statefulset-shadowpod" || "$config" == "statefulset-shadowpod-swap" ]]; then
                 echo -n "    Scaling StatefulSet back..."
                 kubectl scale statefulset consumer --replicas=1 -n "$NAMESPACE"
                 for i in $(seq 1 60); do

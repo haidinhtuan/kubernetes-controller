@@ -69,9 +69,15 @@ spec:
                 type: string
               replayCutoffSeconds:
                 description: ReplayCutoffSeconds is the threshold in seconds to trigger
-                  the final cutoff
+                  the final cutoff. Used when replayMode is Cutoff (the default).
                 format: int32
                 type: integer
+              replayMode:
+                description: 'ReplayMode controls how the Replaying phase determines
+                  completion. "Cutoff" (default): time-based cutoff using replayCutoffSeconds.
+                  "Drain": unbind the secondary queue so it has a fixed message set,
+                  then wait for full drain. Fails only if the queue depth stalls.'
+                type: string
               sourcePod:
                 description: SourcePod is the name of the pod to migrate (must be in
                   the same namespace)
@@ -84,6 +90,13 @@ spec:
                   target node. "Registry" (default): build OCI image, push to registry,
                   target pulls. "Direct": POST checkpoint tar to ms2m-agent on target
                   node via HTTP.'
+                type: string
+              identitySwapMode:
+                description: 'IdentitySwapMode controls how StatefulSet identity is restored
+                  during Finalizing. "None" (default): no identity swap, shadow pod remains
+                  orphaned. "ExchangeFence": full identity swap with Exchange-Fence Convergence
+                  for zero-gap state synchronization. "Cutoff": identity swap with time-based
+                  MiniReplay cutoff (15s).'
                 type: string
             type: object
           status:

@@ -2014,6 +2014,122 @@ func TestReconcile_Replaying_QueueNotDrained_BackoffPath(t *testing.T) {
 	}
 }
 
+// -- handleReplaying (Drain mode): unbinds queue and drains to completion --
+func TestReconcile_Replaying_DrainMode_FullDrain(t *testing.T) {
+	migration := newMigration("mig-replay-drain", migrationv1alpha1.PhaseReplaying)
+	migration.Status.TargetPod = "myapp-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Spec.ReplayMode = "Drain"
+	migration.Spec.MessageQueueConfig.ExchangeName = "app.fanout"
+	migration.Status.PhaseTimings = map[string]string{}
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+
+	// First reconcile: sends START_REPLAY, sets depth
+	secondaryQ := migration.Spec.MessageQueueConfig.QueueName + ".ms2m-replay"
+	mockBroker.SetQueueDepth(secondaryQ, 10)
+
+	_, err := reconcileOnce(r, ctx, "mig-replay-drain", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-replay-drain", "default")
+	if got.Status.Phase != migrationv1alpha1.PhaseReplaying {
+		t.Errorf("expected phase Replaying, got %q", got.Status.Phase)
+	}
+	// Verify START_REPLAY was sent
+	if len(mockBroker.ControlMessages) != 1 {
+		t.Fatalf("expected 1 control message, got %d", len(mockBroker.ControlMessages))
+	}
+
+	// Second reconcile: queue drained
+	mockBroker.SetQueueDepth(secondaryQ, 0)
+
+	_, err = reconcileOnce(r, ctx, "mig-replay-drain", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got = fetchMigration(r, ctx, "mig-replay-drain", "default")
+	if got.Status.Phase != migrationv1alpha1.PhaseCompleted {
+		t.Errorf("expected phase Completed after drain, got %q", got.Status.Phase)
+	}
+	if _, ok := got.Status.PhaseTimings["Replaying"]; !ok {
+		t.Error("expected Replaying phase timing to be recorded")
+	}
+}
+
+// -- handleReplaying (Drain mode): stall detection fails migration --
+func TestReconcile_Replaying_DrainMode_Stalled(t *testing.T) {
+	migration := newMigration("mig-replay-stall", migrationv1alpha1.PhaseReplaying)
+	migration.Status.TargetPod = "myapp-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Spec.ReplayMode = "Drain"
+	migration.Spec.MessageQueueConfig.ExchangeName = "app.fanout"
+	migration.Status.PhaseTimings = map[string]string{
+		"Replaying.start":        time.Now().Add(-60 * time.Second).Format(time.RFC3339),
+		"Replaying.lastDepth":    "50",
+		"Replaying.lastDecrease": time.Now().Add(-35 * time.Second).Format(time.RFC3339),
+	}
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+	secondaryQ := migration.Spec.MessageQueueConfig.QueueName + ".ms2m-replay"
+	mockBroker.SetQueueDepth(secondaryQ, 50) // same depth — stalled
+
+	_, err := reconcileOnce(r, ctx, "mig-replay-stall", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-replay-stall", "default")
+	if got.Status.Phase != migrationv1alpha1.PhaseFailed {
+		t.Errorf("expected phase Failed after stall, got %q", got.Status.Phase)
+	}
+}
+
+// -- handleReplaying (Drain mode): depth decreasing resets stall timer --
+func TestReconcile_Replaying_DrainMode_ProgressResets(t *testing.T) {
+	migration := newMigration("mig-replay-progress", migrationv1alpha1.PhaseReplaying)
+	migration.Status.TargetPod = "myapp-0-shadow"
+	migration.Status.SourceNode = "node-1"
+	migration.Spec.ReplayMode = "Drain"
+	migration.Spec.MessageQueueConfig.ExchangeName = "app.fanout"
+	migration.Status.PhaseTimings = map[string]string{
+		"Replaying.start":        time.Now().Add(-60 * time.Second).Format(time.RFC3339),
+		"Replaying.lastDepth":    "100",
+		"Replaying.lastDecrease": time.Now().Add(-25 * time.Second).Format(time.RFC3339),
+	}
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+	secondaryQ := migration.Spec.MessageQueueConfig.QueueName + ".ms2m-replay"
+	mockBroker.SetQueueDepth(secondaryQ, 80) // decreased from 100
+
+	result, err := reconcileOnce(r, ctx, "mig-replay-progress", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-replay-progress", "default")
+	if got.Status.Phase != migrationv1alpha1.PhaseReplaying {
+		t.Errorf("expected phase Replaying (still draining), got %q", got.Status.Phase)
+	}
+	if result.RequeueAfter != 2*time.Second {
+		t.Errorf("expected 2s requeue in drain mode, got %v", result.RequeueAfter)
+	}
+	// lastDecrease should have been updated (recent)
+	if decreaseStr, ok := got.Status.PhaseTimings["Replaying.lastDecrease"]; ok {
+		if decreaseTime, parseErr := time.Parse(time.RFC3339, decreaseStr); parseErr == nil {
+			if time.Since(decreaseTime) > 5*time.Second {
+				t.Error("expected lastDecrease to be updated to recent time")
+			}
+		}
+	}
+}
+
 // -- handleFinalizing: END_REPLAY fails (non-fatal, migration still completes) --
 func TestReconcile_Finalizing_EndReplayFails(t *testing.T) {
 	migration := newMigration("mig-final-endfail", migrationv1alpha1.PhaseFinalizing)
@@ -2109,6 +2225,7 @@ func TestReconcile_Finalizing_ShadowPod_ScalesDownStatefulSet(t *testing.T) {
 	migration := newMigration("mig-final-shadow-sts", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.IdentitySwapMode = "Cutoff"
 	migration.Status.TargetPod = "consumer-0-shadow"
 	migration.Status.SourceNode = "node-1"
 	migration.Status.StatefulSetName = "consumer"
@@ -2157,6 +2274,7 @@ func TestReconcile_Finalizing_ShadowPod_MultiReplicaStatefulSet(t *testing.T) {
 	migration := newMigration("mig-final-shadow-multi", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.IdentitySwapMode = "Cutoff"
 	migration.Status.TargetPod = "consumer-0-shadow"
 	migration.Status.SourceNode = "node-1"
 	migration.Status.StatefulSetName = "consumer"
@@ -3383,6 +3501,7 @@ func TestReconcile_Finalizing_ShadowPod_StatefulSet_EntersSwap(t *testing.T) {
 	migration := newMigration("mig-swap", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.IdentitySwapMode = "Cutoff"
 	migration.Status.TargetPod = "consumer-0-shadow"
 	migration.Status.SourceNode = "node-1"
 	migration.Status.StatefulSetName = "consumer"
@@ -3424,6 +3543,7 @@ func TestReconcile_Finalizing_Swap_ReCheckpoint(t *testing.T) {
 	migration := newMigration("mig-swap-ckpt", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.IdentitySwapMode = "Cutoff"
 	migration.Spec.TargetNode = "node-2"
 	migration.Status.TargetPod = "consumer-0-shadow"
 	migration.Status.SourceNode = "node-1"
@@ -3469,6 +3589,7 @@ func TestReconcile_Finalizing_Swap_SwapTransfer(t *testing.T) {
 	migration := newMigration("mig-swap-xfer", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.IdentitySwapMode = "Cutoff"
 	migration.Spec.TargetNode = "node-2"
 	migration.Spec.CheckpointImageRepository = "registry.example.com/checkpoints"
 	migration.Status.TargetPod = "consumer-0-shadow"
@@ -3550,6 +3671,7 @@ func TestReconcile_Finalizing_Swap_CreateReplacement(t *testing.T) {
 	migration := newMigration("mig-swap-create", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.IdentitySwapMode = "Cutoff"
 	migration.Spec.TargetNode = "node-2"
 	migration.Status.TargetPod = "consumer-0-shadow"
 	migration.Status.SourceNode = "node-1"
@@ -3608,6 +3730,7 @@ func TestReconcile_Finalizing_Swap_MiniReplay_Drained(t *testing.T) {
 	migration := newMigration("mig-swap-replay", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.IdentitySwapMode = "Cutoff"
 	migration.Status.TargetPod = "consumer-0-shadow"
 	migration.Status.SourceNode = "node-1"
 	migration.Status.StatefulSetName = "consumer"
@@ -3652,6 +3775,7 @@ func TestReconcile_Finalizing_Swap_MiniReplay_Pending(t *testing.T) {
 	migration := newMigration("mig-swap-replay-pending", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.IdentitySwapMode = "Cutoff"
 	migration.Status.TargetPod = "consumer-0-shadow"
 	migration.Status.SourceNode = "node-1"
 	migration.Status.StatefulSetName = "consumer"
@@ -3732,6 +3856,7 @@ func TestReconcile_Finalizing_Swap_TrafficSwitch(t *testing.T) {
 	migration := newMigration("mig-swap-switch", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.IdentitySwapMode = "Cutoff"
 	migration.Status.TargetPod = "consumer-0-shadow"
 	migration.Status.SourceNode = "node-1"
 	migration.Status.StatefulSetName = "consumer"
@@ -3836,6 +3961,7 @@ func TestReconcile_Finalizing_ShadowPod_StatefulSet_FullSwap(t *testing.T) {
 	migration := newMigration("mig-e2e-swap", migrationv1alpha1.PhaseFinalizing)
 	migration.Spec.SourcePod = "consumer-0"
 	migration.Spec.MigrationStrategy = "ShadowPod"
+	migration.Spec.IdentitySwapMode = "Cutoff"
 	migration.Spec.TargetNode = "node-2"
 	migration.Spec.TransferMode = "Direct"
 	migration.Status.TargetPod = "consumer-0-shadow"
@@ -3948,4 +4074,509 @@ func TestReconcile_Finalizing_ShadowPod_StatefulSet_FullSwap(t *testing.T) {
 	}
 
 	t.Fatal("swap did not complete within 30 iterations")
+}
+
+// ---------------------------------------------------------------------------
+// Exchange-Fence sub-phase tests
+// ---------------------------------------------------------------------------
+
+func newExchangeFenceMigration(name string) *migrationv1alpha1.StatefulMigration {
+	m := newMigration(name, migrationv1alpha1.PhaseFinalizing)
+	m.Spec.SourcePod = "consumer-0"
+	m.Spec.MigrationStrategy = "ShadowPod"
+	m.Spec.IdentitySwapMode = "ExchangeFence"
+	m.Spec.TargetNode = "node-2"
+	m.Spec.MessageQueueConfig = migrationv1alpha1.MessageQueueConfig{
+		BrokerURL:    "amqp://localhost:5672",
+		QueueName:    "orders",
+		ExchangeName: "app.fanout",
+		RoutingKey:   "",
+	}
+	m.Status.TargetPod = "consumer-0-shadow"
+	m.Status.SourceNode = "node-1"
+	m.Status.StatefulSetName = "consumer"
+	m.Status.ContainerName = "app"
+	m.Status.PhaseTimings = map[string]string{}
+	return m
+}
+
+// Test: CreateReplacement routes to PreFenceDrain when IdentitySwapMode=ExchangeFence
+func TestReconcile_ExchangeFence_CreateReplacement_RoutesToPreFence(t *testing.T) {
+	stsReplicas := int32(1)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "consumer", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &stsReplicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "consumer"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "consumer"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}}},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{UpdateRevision: "consumer-abc123"},
+	}
+
+	// Replacement pod already exists on target node and is Running
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "consumer-0",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "consumer"},
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-2"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	migration := newExchangeFenceMigration("mig-ef-route")
+	migration.Status.SwapSubPhase = "CreateReplacement"
+	migration.Status.CheckpointID = "/var/lib/kubelet/checkpoints/checkpoint-consumer-0-shadow.tar"
+
+	r, mockBroker, ctx := setupTest(migration, sts, replacementPod)
+	mockBroker.Connected = true
+
+	_, err := reconcileOnce(r, ctx, "mig-ef-route", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-ef-route", "default")
+	if got.Status.SwapSubPhase != "PreFenceDrain" {
+		t.Errorf("expected SwapSubPhase 'PreFenceDrain', got %q", got.Status.SwapSubPhase)
+	}
+}
+
+// Test: PreFenceDrain sends START_REPLAY, measures rates, and uses adaptive decision
+func TestReconcile_ExchangeFence_PreFenceDrain(t *testing.T) {
+	migration := newExchangeFenceMigration("mig-ef-prefence")
+	migration.Status.SwapSubPhase = "PreFenceDrain"
+	migration.Status.ReplacementPod = "consumer-0"
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "consumer-0", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: "node-2"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	r, mockBroker, ctx := setupTest(migration, replacementPod)
+	mockBroker.Connected = true
+	// Set initial swap depth high — will be recorded as initialDepth
+	mockBroker.SetQueueDepth("orders.ms2m-replay", 100)
+
+	// First reconcile: sends START_REPLAY, records initial depth, waits for samples
+	result, err := reconcileOnce(r, ctx, "mig-ef-prefence", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should send START_REPLAY
+	if len(mockBroker.ControlMessages) != 1 {
+		t.Fatalf("expected 1 control message, got %d", len(mockBroker.ControlMessages))
+	}
+	if mockBroker.ControlMessages[0].Type != messaging.ControlStartReplay {
+		t.Errorf("expected START_REPLAY, got %q", mockBroker.ControlMessages[0].Type)
+	}
+
+	// Should requeue (waiting 3s for rate samples)
+	if result.RequeueAfter == 0 {
+		t.Error("expected RequeueAfter > 0 while collecting rate samples")
+	}
+
+	// Simulate 4s passing and queue draining from 100 → 10 (showing R_out > R_in)
+	got := fetchMigration(r, ctx, "mig-ef-prefence", "default")
+	patch := client.MergeFrom(got.DeepCopy())
+	got.Status.PhaseTimings["Swap.PreFence.start"] = time.Now().Add(-4 * time.Second).Format(time.RFC3339)
+	_ = r.Status().Patch(ctx, got, patch)
+
+	// Simulate consumption: depth dropped from 100 to 10
+	mockBroker.SetQueueDepth("orders.ms2m-replay", 10)
+	mockBroker.SetQueueDepth("orders", 15)
+
+	// Second reconcile: adaptive decision sees net drain (100→10 in 4s = 22.5 msg/s)
+	// max(10, 15) / 22.5 ≈ 0.67s estimated fence time → use Exchange-Fence
+	// Chain: PreFenceDrain → ExchangeFence → ParallelDrain (stops, queues non-zero)
+	_, err = reconcileOnce(r, ctx, "mig-ef-prefence", "default")
+	if err != nil {
+		t.Fatalf("unexpected error on second reconcile: %v", err)
+	}
+
+	got = fetchMigration(r, ctx, "mig-ef-prefence", "default")
+	if got.Status.SwapSubPhase != "ParallelDrain" {
+		t.Errorf("expected SwapSubPhase 'ParallelDrain' (chain: PreFence→Fence→ParallelDrain), got %q", got.Status.SwapSubPhase)
+	}
+}
+
+// Test: PreFenceDrain falls back to MiniReplay when queue is growing (ρ > 1)
+func TestReconcile_ExchangeFence_PreFenceDrain_FallbackToCutoff(t *testing.T) {
+	migration := newExchangeFenceMigration("mig-ef-fallback")
+	migration.Status.SwapSubPhase = "PreFenceDrain"
+	migration.Status.ReplacementPod = "consumer-0"
+	// Simulate: started 4s ago with initial depth 10, now depth is 50 (growing)
+	migration.Status.PhaseTimings["Swap.PreFence.start"] = time.Now().Add(-4 * time.Second).Format(time.RFC3339)
+	migration.Status.PhaseTimings["Swap.PreFence.initialDepth"] = "10"
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+	// Queue is growing: was 10, now 50
+	mockBroker.SetQueueDepth("orders.ms2m-replay", 50)
+	mockBroker.SetQueueDepth("orders", 5)
+
+	_, err := reconcileOnce(r, ctx, "mig-ef-fallback", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-ef-fallback", "default")
+	// Should fall back to MiniReplay since queue is growing
+	if got.Status.SwapSubPhase != "MiniReplay" {
+		t.Errorf("expected fallback to 'MiniReplay', got %q", got.Status.SwapSubPhase)
+	}
+}
+
+// Test: ExchangeFence creates buffer, unbinds primary and swap, transitions to ParallelDrain
+func TestReconcile_ExchangeFence_Fence(t *testing.T) {
+	migration := newExchangeFenceMigration("mig-ef-fence")
+	migration.Status.SwapSubPhase = "ExchangeFence"
+	migration.Status.ReplacementPod = "consumer-0"
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+	mockBroker.Queues["orders"] = 5
+	mockBroker.Queues["orders.ms2m-replay"] = 3
+
+	_, err := reconcileOnce(r, ctx, "mig-ef-fence", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-ef-fence", "default")
+	if got.Status.SwapSubPhase != "ParallelDrain" {
+		t.Errorf("expected SwapSubPhase 'ParallelDrain', got %q", got.Status.SwapSubPhase)
+	}
+
+	// Buffer queue should have been created
+	if _, exists := mockBroker.Queues["orders.ms2m-fence-buffer"]; !exists {
+		t.Error("expected buffer queue 'orders.ms2m-fence-buffer' to be created")
+	}
+
+	// Depths should be recorded
+	if got.Status.PhaseTimings["Swap.Fence.primaryDepth"] != "5" {
+		t.Errorf("expected primary depth '5', got %q", got.Status.PhaseTimings["Swap.Fence.primaryDepth"])
+	}
+	if got.Status.PhaseTimings["Swap.Fence.swapDepth"] != "3" {
+		t.Errorf("expected swap depth '3', got %q", got.Status.PhaseTimings["Swap.Fence.swapDepth"])
+	}
+}
+
+// Test: ParallelDrain completes when both queues reach zero, chains into FenceCutover
+func TestReconcile_ExchangeFence_ParallelDrain_BothDrained(t *testing.T) {
+	stsReplicas := int32(0)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "consumer", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &stsReplicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "consumer"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "consumer"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}}},
+			},
+		},
+	}
+	shadowPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "consumer-0-shadow", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: "node-2"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	migration := newExchangeFenceMigration("mig-ef-drain")
+	migration.Status.SwapSubPhase = "ParallelDrain"
+	migration.Status.ReplacementPod = "consumer-0"
+	migration.Status.OriginalReplicas = 1
+	migration.Status.PhaseTimings["Swap.Fence.time"] = time.Now().Format(time.RFC3339)
+	migration.Status.PhaseTimings["Swap.Fence.primaryDepth"] = "5"
+	migration.Status.PhaseTimings["Swap.Fence.swapDepth"] = "3"
+
+	r, mockBroker, ctx := setupTest(migration, sts, shadowPod)
+	mockBroker.Connected = true
+	// Both queues drained — chain will run through FenceCutover
+	mockBroker.Queues["orders"] = 0
+	mockBroker.Queues["orders.ms2m-replay"] = 0
+	mockBroker.Queues["orders.ms2m-fence-buffer"] = 0
+
+	_, err := reconcileOnce(r, ctx, "mig-ef-drain", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-ef-drain", "default")
+	// Chain runs ParallelDrain → FenceCutover → done (SwapSubPhase cleared)
+	if got.Status.SwapSubPhase != "" {
+		t.Errorf("expected SwapSubPhase cleared (chain completed), got %q", got.Status.SwapSubPhase)
+	}
+	if got.Status.TargetPod != "consumer-0" {
+		t.Errorf("expected TargetPod 'consumer-0', got %q", got.Status.TargetPod)
+	}
+}
+
+// Test: ParallelDrain requeues when queues still have messages
+func TestReconcile_ExchangeFence_ParallelDrain_Pending(t *testing.T) {
+	migration := newExchangeFenceMigration("mig-ef-drain-pending")
+	migration.Status.SwapSubPhase = "ParallelDrain"
+	migration.Status.ReplacementPod = "consumer-0"
+	migration.Status.PhaseTimings["Swap.Fence.time"] = time.Now().Format(time.RFC3339)
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+	mockBroker.Queues["orders"] = 10
+	mockBroker.Queues["orders.ms2m-replay"] = 5
+
+	result, err := reconcileOnce(r, ctx, "mig-ef-drain-pending", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-ef-drain-pending", "default")
+	if got.Status.SwapSubPhase != "ParallelDrain" {
+		t.Errorf("expected to stay in 'ParallelDrain', got %q", got.Status.SwapSubPhase)
+	}
+	if result.RequeueAfter == 0 {
+		t.Error("expected RequeueAfter > 0 while draining")
+	}
+}
+
+// Test: FenceCutover kills shadow, rebinds primary, sends END_REPLAY, completes
+func TestReconcile_ExchangeFence_FenceCutover(t *testing.T) {
+	stsReplicas := int32(0)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "consumer", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &stsReplicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "consumer"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "consumer"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}}},
+			},
+		},
+	}
+
+	shadowPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "consumer-0-shadow", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: "node-2"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "consumer-0", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: "node-2"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	migration := newExchangeFenceMigration("mig-ef-cutover")
+	migration.Status.SwapSubPhase = "FenceCutover"
+	migration.Status.ReplacementPod = "consumer-0"
+	migration.Status.OriginalReplicas = 1
+
+	r, mockBroker, ctx := setupTest(migration, sts, shadowPod, replacementPod)
+	mockBroker.Connected = true
+	// Buffer queue empty
+	mockBroker.Queues["orders.ms2m-fence-buffer"] = 0
+	mockBroker.Queues["orders.ms2m-replay"] = 0
+
+	_, err := reconcileOnce(r, ctx, "mig-ef-cutover", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-ef-cutover", "default")
+
+	// Should complete the swap (SwapSubPhase cleared)
+	if got.Status.SwapSubPhase != "" {
+		t.Errorf("expected SwapSubPhase to be cleared, got %q", got.Status.SwapSubPhase)
+	}
+
+	// TargetPod should point to replacement
+	if got.Status.TargetPod != "consumer-0" {
+		t.Errorf("expected TargetPod 'consumer-0', got %q", got.Status.TargetPod)
+	}
+
+	// Shadow pod should be deleted
+	shadowCheck := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "consumer-0-shadow", Namespace: "default"}, shadowCheck); err == nil {
+		t.Error("expected shadow pod to be deleted")
+	}
+
+	// Should have sent END_REPLAY
+	foundEndReplay := false
+	for _, msg := range mockBroker.ControlMessages {
+		if msg.Type == messaging.ControlEndReplay && msg.TargetPod == "consumer-0" {
+			foundEndReplay = true
+		}
+	}
+	if !foundEndReplay {
+		t.Error("expected END_REPLAY control message to replacement pod")
+	}
+
+	// StatefulSet should be scaled up
+	stsCheck := &appsv1.StatefulSet{}
+	_ = r.Get(ctx, types.NamespacedName{Name: "consumer", Namespace: "default"}, stsCheck)
+	if stsCheck.Spec.Replicas == nil || *stsCheck.Spec.Replicas != 1 {
+		t.Errorf("expected StatefulSet replicas 1, got %v", stsCheck.Spec.Replicas)
+	}
+}
+
+// Test: ParallelDrain rolls back to MiniReplay on stall
+func TestReconcile_ExchangeFence_ParallelDrain_Rollback(t *testing.T) {
+	migration := newExchangeFenceMigration("mig-ef-rollback")
+	migration.Status.SwapSubPhase = "ParallelDrain"
+	migration.Status.ReplacementPod = "consumer-0"
+	migration.Status.PhaseTimings["Swap.Fence.time"] = time.Now().Add(-10 * time.Second).Format(time.RFC3339)
+	// Simulate a stall: depth unchanged for >30s
+	migration.Status.PhaseTimings["Swap.ParallelDrain.lastDepth"] = "5,3"
+	migration.Status.PhaseTimings["Swap.ParallelDrain.lastCheck"] = time.Now().Add(-35 * time.Second).Format(time.RFC3339)
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+	mockBroker.Queues["orders"] = 5
+	mockBroker.Queues["orders.ms2m-replay"] = 3
+	mockBroker.Queues["orders.ms2m-fence-buffer"] = 0
+
+	_, err := reconcileOnce(r, ctx, "mig-ef-rollback", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-ef-rollback", "default")
+	// Should fall back to MiniReplay
+	if got.Status.SwapSubPhase != "MiniReplay" {
+		t.Errorf("expected rollback to 'MiniReplay', got %q", got.Status.SwapSubPhase)
+	}
+	// Should set MiniReplay.start to prevent duplicate START_REPLAY
+	if _, ok := got.Status.PhaseTimings["Swap.MiniReplay.start"]; !ok {
+		t.Error("expected Swap.MiniReplay.start to be set after rollback")
+	}
+}
+
+// Test: ParallelDrain rolls back to MiniReplay on timeout (>120s)
+func TestReconcile_ExchangeFence_ParallelDrain_Timeout(t *testing.T) {
+	migration := newExchangeFenceMigration("mig-ef-timeout")
+	migration.Status.SwapSubPhase = "ParallelDrain"
+	migration.Status.ReplacementPod = "consumer-0"
+	// Fence time >120s ago → timeout
+	migration.Status.PhaseTimings["Swap.Fence.time"] = time.Now().Add(-125 * time.Second).Format(time.RFC3339)
+	// Depth is still changing (no stall), but timeout fires anyway
+	migration.Status.PhaseTimings["Swap.ParallelDrain.lastDepth"] = "5,3"
+	migration.Status.PhaseTimings["Swap.ParallelDrain.lastCheck"] = time.Now().Add(-5 * time.Second).Format(time.RFC3339)
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+	mockBroker.Queues["orders"] = 5
+	mockBroker.Queues["orders.ms2m-replay"] = 3
+	mockBroker.Queues["orders.ms2m-fence-buffer"] = 0
+
+	_, err := reconcileOnce(r, ctx, "mig-ef-timeout", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-ef-timeout", "default")
+	if got.Status.SwapSubPhase != "MiniReplay" {
+		t.Errorf("expected timeout rollback to 'MiniReplay', got %q", got.Status.SwapSubPhase)
+	}
+	if _, ok := got.Status.PhaseTimings["Swap.MiniReplay.start"]; !ok {
+		t.Error("expected Swap.MiniReplay.start to be set after timeout rollback")
+	}
+}
+
+// Test: ParallelDrain rollback with non-zero buffer queue (message loss scenario)
+func TestReconcile_ExchangeFence_ParallelDrain_Rollback_NonEmptyBuffer(t *testing.T) {
+	migration := newExchangeFenceMigration("mig-ef-rollback-buf")
+	migration.Status.SwapSubPhase = "ParallelDrain"
+	migration.Status.ReplacementPod = "consumer-0"
+	migration.Status.PhaseTimings["Swap.Fence.time"] = time.Now().Add(-10 * time.Second).Format(time.RFC3339)
+	// Stall detected
+	migration.Status.PhaseTimings["Swap.ParallelDrain.lastDepth"] = "5,3"
+	migration.Status.PhaseTimings["Swap.ParallelDrain.lastCheck"] = time.Now().Add(-35 * time.Second).Format(time.RFC3339)
+
+	r, mockBroker, ctx := setupTest(migration)
+	mockBroker.Connected = true
+	mockBroker.Queues["orders"] = 5
+	mockBroker.Queues["orders.ms2m-replay"] = 3
+	// Buffer has accumulated messages during fence window
+	mockBroker.Queues["orders.ms2m-fence-buffer"] = 12
+
+	_, err := reconcileOnce(r, ctx, "mig-ef-rollback-buf", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := fetchMigration(r, ctx, "mig-ef-rollback-buf", "default")
+	if got.Status.SwapSubPhase != "MiniReplay" {
+		t.Errorf("expected rollback to 'MiniReplay', got %q", got.Status.SwapSubPhase)
+	}
+}
+
+// Test: FenceCutover with non-empty buffer queue triggers buffer drain
+func TestReconcile_ExchangeFence_FenceCutover_BufferDrain(t *testing.T) {
+	stsReplicas := int32(0)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "consumer", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &stsReplicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "consumer"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "consumer"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "consumer:latest"}}},
+			},
+		},
+	}
+
+	shadowPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "consumer-0-shadow", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: "node-2"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	replacementPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "consumer-0", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: "node-2"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	migration := newExchangeFenceMigration("mig-ef-bufdrain")
+	migration.Status.SwapSubPhase = "FenceCutover"
+	migration.Status.ReplacementPod = "consumer-0"
+	migration.Status.OriginalReplicas = 1
+
+	r, mockBroker, ctx := setupTest(migration, sts, shadowPod, replacementPod)
+	mockBroker.Connected = true
+	// Buffer queue has messages that need draining
+	mockBroker.Queues["orders.ms2m-fence-buffer"] = 5
+	mockBroker.Queues["orders.ms2m-replay"] = 0
+
+	result, err := reconcileOnce(r, ctx, "mig-ef-bufdrain", "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should requeue to wait for buffer drain
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue while buffer is draining")
+	}
+
+	got := fetchMigration(r, ctx, "mig-ef-bufdrain", "default")
+
+	// Should have sent START_REPLAY for buffer queue
+	foundBufferReplay := false
+	for _, msg := range mockBroker.ControlMessages {
+		if msg.Type == messaging.ControlStartReplay && msg.TargetPod == "consumer-0" {
+			foundBufferReplay = true
+		}
+	}
+	if !foundBufferReplay {
+		t.Error("expected START_REPLAY for buffer queue drain")
+	}
+
+	// BufferDrain.start should be recorded
+	if _, ok := got.Status.PhaseTimings["Swap.BufferDrain.start"]; !ok {
+		t.Error("expected Swap.BufferDrain.start to be set")
+	}
 }
