@@ -1050,7 +1050,22 @@ func (r *StatefulMigrationReconciler) handleSwapReCheckpoint(ctx context.Context
 			m.Status.ContainerName,
 		)
 		if err != nil {
-			return ctrl.Result{}, false, fmt.Errorf("re-checkpoint shadow pod: %w", err)
+			// Re-checkpoint of CRIU-restored containers fails with CRIU error -52
+			// due to reconstructed TCP socket states after restore. This is a known
+			// CRIU limitation: checkpointing a process that was itself restored from
+			// a CRIU checkpoint produces socket states that CRIU cannot serialize again.
+			// Fall back to the original checkpoint image — the replacement pod will
+			// replay from the pre-migration state via the swap queue.
+			logger.Info("Re-checkpoint failed, falling back to original checkpoint image",
+				"error", err.Error())
+			patch := client.MergeFrom(m.DeepCopy())
+			m.Status.SwapSubPhase = "CreateReplacement"
+			m.Status.PhaseTimings["Swap.ReCheckpoint.fallback"] = "true"
+			if err := r.Status().Patch(ctx, m, patch); err != nil {
+				return ctrl.Result{}, false, err
+			}
+			logger.Info("Skipping SwapTransfer (using original checkpoint image)")
+			return ctrl.Result{Requeue: true}, false, nil
 		}
 		if len(resp.Items) > 0 {
 			patch := client.MergeFrom(m.DeepCopy())
@@ -1334,10 +1349,17 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 		return ctrl.Result{}, false, err
 	}
 
-	// The re-checkpoint was loaded into local containers-storage by SwapTransfer
-	// (same node, no registry needed)
-	checkpointImage := fmt.Sprintf("localhost/checkpoint/%s:recheckpoint", m.Status.ContainerName)
-	pullPolicy := corev1.PullNever
+	// Use the re-checkpoint image if SwapTransfer ran, otherwise fall back
+	// to the original checkpoint image from the registry.
+	var checkpointImage string
+	var pullPolicy corev1.PullPolicy
+	if m.Status.PhaseTimings["Swap.ReCheckpoint.fallback"] == "true" {
+		checkpointImage = fmt.Sprintf("%s/%s:checkpoint", m.Spec.CheckpointImageRepository, m.Spec.SourcePod)
+		pullPolicy = corev1.PullAlways
+	} else {
+		checkpointImage = fmt.Sprintf("localhost/checkpoint/%s:recheckpoint", m.Status.ContainerName)
+		pullPolicy = corev1.PullNever
+	}
 
 	// Build containers from source containers captured during Pending.
 	// Set MS2M_RESTORE_MODE=true so the CRIU-restored process blocks on the
@@ -1413,16 +1435,20 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 	// Scale the StatefulSet back up. The nodeSelector was already updated
 	// during scale-down, so we only need to restore the replica count.
 	// Without scale-up, the STS (at replicas=0) won't adopt our replacement.
-	if m.Status.StatefulSetName != "" && m.Status.OriginalReplicas > 0 {
+	if m.Status.StatefulSetName != "" {
+		targetReplicas := m.Status.OriginalReplicas
+		if targetReplicas == 0 {
+			targetReplicas = 1 // fallback: at least 1 replica to adopt the replacement
+		}
 		sts := &appsv1.StatefulSet{}
 		if stsErr := r.Get(ctx, types.NamespacedName{Name: m.Status.StatefulSetName, Namespace: m.Namespace}, sts); stsErr == nil {
-			if sts.Spec.Replicas == nil || *sts.Spec.Replicas < m.Status.OriginalReplicas {
+			if sts.Spec.Replicas == nil || *sts.Spec.Replicas < targetReplicas {
 				stsPatch := client.MergeFrom(sts.DeepCopy())
-				sts.Spec.Replicas = &m.Status.OriginalReplicas
+				sts.Spec.Replicas = &targetReplicas
 				if patchErr := r.Patch(ctx, sts, stsPatch); patchErr != nil {
 					logger.Error(patchErr, "Failed to scale up StatefulSet after creating replacement")
 				} else {
-					logger.Info("Scaled up StatefulSet for identity swap", "statefulset", m.Status.StatefulSetName, "replicas", m.Status.OriginalReplicas)
+					logger.Info("Scaled up StatefulSet for identity swap", "statefulset", m.Status.StatefulSetName, "replicas", targetReplicas)
 				}
 			}
 		}
