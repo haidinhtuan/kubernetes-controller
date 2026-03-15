@@ -1339,7 +1339,12 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 	checkpointImage := fmt.Sprintf("localhost/checkpoint/%s:recheckpoint", m.Status.ContainerName)
 	pullPolicy := corev1.PullNever
 
-	// Build containers from source containers captured during Pending
+	// Build containers from source containers captured during Pending.
+	// Set MS2M_RESTORE_MODE=true so the CRIU-restored process blocks on the
+	// primary queue until START_REPLAY arrives. Without this, the replacement
+	// pod immediately reconnects to primary after restore, racing with the
+	// shadow pod and causing duplicate consumption.
+	restoreModeEnv := corev1.EnvVar{Name: "MS2M_RESTORE_MODE", Value: "true"}
 	var containers []corev1.Container
 	if len(m.Status.SourceContainers) > 0 {
 		for _, c := range m.Status.SourceContainers {
@@ -1348,6 +1353,7 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 				Image:           checkpointImage,
 				ImagePullPolicy: pullPolicy,
 				Ports:           c.Ports,
+				Env:             append(c.Env, restoreModeEnv),
 			}
 			if c.Name != m.Status.ContainerName {
 				restored.Image = c.Image
@@ -1359,6 +1365,7 @@ func (r *StatefulMigrationReconciler) handleSwapCreateReplacement(ctx context.Co
 			Name:            m.Status.ContainerName,
 			Image:           checkpointImage,
 			ImagePullPolicy: pullPolicy,
+			Env:             []corev1.EnvVar{restoreModeEnv},
 		}}
 	}
 
