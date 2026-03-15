@@ -140,7 +140,8 @@ kubectl describe statefulmigration migrate-consumer-0
 |:------------|:--------|
 | **Kubernetes** | v1.30+ with `ContainerCheckpoint` feature gate enabled |
 | **Container Runtime** | CRI-O with CRIU checkpoint/restore support |
-| **CRIU** | Installed on all worker nodes |
+| **CRIU** | v4.0+ installed on all worker nodes |
+| **crun** | v1.21+ (required for re-checkpoint support; v1.19 and earlier have a [cgroup namespace root bug](https://github.com/containers/crun/issues/1651) that prevents re-checkpointing restored containers) |
 | **Container Registry** | Accessible from all nodes (Registry transfer mode) |
 | **Message Broker** | RabbitMQ (AMQP 0-9-1) |
 | **Go** | v1.25+ (for building from source) |
