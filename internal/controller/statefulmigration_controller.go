@@ -1842,9 +1842,11 @@ func (r *StatefulMigrationReconciler) handleSwapParallelDrain(ctx context.Contex
 		"primaryTotal", primaryTotal, "swapTotal", swapTotal,
 		"elapsed", elapsed.Round(time.Millisecond))
 
-	// Both drained — proceed to cutover
-	if primaryTotal == 0 && swapTotal == 0 {
-		logger.Info("ParallelDrain complete — both queues drained")
+	// Swap queue must be fully drained before deletion; primary queue is
+	// never deleted so the replacement pod will consume it naturally.
+	if swapTotal == 0 {
+		logger.Info("ParallelDrain complete — swap queue drained",
+			"primaryRemaining", primaryTotal)
 		patch := client.MergeFrom(m.DeepCopy())
 		delete(m.Status.PhaseTimings, "Swap.Fence.time")
 		delete(m.Status.PhaseTimings, "Swap.Fence.primaryDepth")
