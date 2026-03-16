@@ -214,74 +214,19 @@ Evaluated on a 3-node bare-metal Kubernetes cluster (dedicated servers from a Eu
 
 ### Total Migration Time
 
-```
-Total Migration Time (seconds, median n=10)
-
-  160 ┤ ■────────────────────■──■──■
-      │
-  140 ┤                      ◆──◆──◆
-      │
-  120 ┤                      ●──●──●
-      │                      ○──○──○
-  100 ┤
-      │
-   80 ┤    ■
-      │
-   60 ┤         ■          ◆
-      │■                   ●
-   40 ┤■                   ○
-      │
-   20 ┤●  ●  ●  ●  ◆  ◆
-      │◆  ◆  ◆       ○
-   10 ┤●  ●  ●  ○  ○
-      │○  ○  ○
-    0 ┼───┬───┬───┬───┬───┬───┬───
-      10  20  40  60  80 100 120  msg/s
-
-  ■ SS-Sequential  ● SS-ShadowPod  ◆ SS-Swap  ○ D-Registry
-  ── Replay cutoff: 120s
-```
+![Total Migration Time](docs/images/total-migration-time.png)
 
 At low rates (10 msg/s), ShadowPod reduces migration time by **82--83%** (45.4s to 7.7--8.0s). SS-Swap adds 8--9s for the Exchange-Fence identity swap (15.8s, 65% reduction). At high rates (>=100 msg/s), the 120s replay cutoff dominates, narrowing the gap to 12--22%.
 
 ### Service Downtime
 
-```
-Service Downtime (seconds, median n=10)
-
- 38.5 ┤■──■──■──■──■──■──■   Sequential: ~38.5s (all rates)
-      │
-      │
-      │
-    0 ┤●──●──●──●──●──●──●   SS-ShadowPod:  0ms (210/210 runs)
-      ◆──◆──◆──◆──◆──◆──◆   SS-Swap:       0ms (210/210 runs)
-      ○──○──○──○──○──○──○   Deployment:    0ms (70/70 runs)
-      ┼───┬───┬───┬───┬───┬───┬───
-      10  20  40  60  80 100 120  msg/s
-```
+![Service Downtime](docs/images/service-downtime.png)
 
 All three ShadowPod configurations achieve **zero measured downtime** across all 210 runs. The Exchange-Fence identity swap does not introduce additional downtime because the shadow pod continues serving traffic throughout the swap procedure. The Sequential baseline shows a consistent ~38.5s gap corresponding to the restore phase.
 
 ### Phase Breakdown at 60 msg/s
 
-```
-Phase Duration Breakdown (median seconds at 60 msg/s)
-
-SS-Sequential  |▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓████████████████████████████████| 131.1s
-               |ckpt|T|      restore (38.8s)     |    replay (90.6s)     |
-
-SS-ShadowPod   |▓▓▓██|                                                  19.6s
-               |ckpt|T|R|  replay (14.6s)  |
-
-SS-Swap        |▓▓▓██░░░░░░|                                            31.8s
-               |ckpt|T|R|  replay (13.4s)  | finalize (14.7s) |
-
-D-Registry     |▓▓▓██|                                                  18.1s
-               |ckpt|T|R|  replay (12.6s) |
-
-  ▓ Checkpoint + Transfer + Restore  █ Replay  ░ Finalize (Exchange-Fence)
-  T = Transfer (<1.3s)  R = Restore (~2.9s)
-```
+![Phase Breakdown at 60 msg/s](docs/images/phase-breakdown-60.png)
 
 The restore phase -- which dominates Sequential at 38.8s -- is reduced to ~2.9s with ShadowPod (92% reduction). SS-Swap's visible finalize overhead (14.7s) reflects the Exchange-Fence identity swap: re-checkpoint, replacement pod creation, parallel queue drain, and StatefulSet adoption.
 

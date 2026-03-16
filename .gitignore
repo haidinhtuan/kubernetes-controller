@@ -53,7 +53,8 @@ papers/*.pdf
 
 # Internal docs
 PLAN.md
-docs/
+docs/*.md
+docs/*.txt
 
 # Claude Code
 CLAUDE.md
