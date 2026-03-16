@@ -1,0 +1,196 @@
+=== Phase 2: StatefulSet outliers (13 runs) ===
+
+=== Rerunning: statefulset-sequential rate=20 run=13 ===
+deployment.apps/message-producer env updated
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-sequential-r20-n13 created
+  Waiting............. Completed
+  RESULT: 13,20,statefulset-sequential,57.37200000000001s,351ms,198ms,38.877s,16.934s,1.012s,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-sequential-r20-n13" deleted
+  Waiting for consumer-0............pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-sequential rate=40 run=21 ===
+deployment.apps/message-producer env updated
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-sequential-r40-n21 created
+  Waiting................ Completed
+  RESULT: 21,40,statefulset-sequential,75.372s,476ms,203ms,38.504s,35.564s,625ms,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-sequential-r40-n21" deleted
+  Waiting for consumer-0........pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-sequential rate=40 run=27 ===
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-sequential-r40-n27 created
+  Waiting................ Completed
+  RESULT: 27,40,statefulset-sequential,75.852s,388ms,197ms,38.692s,35.758s,817ms,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-sequential-r40-n27" deleted
+  Waiting for consumer-0............pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-sequential rate=40 run=28 ===
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-sequential-r40-n28 created
+  Waiting................ Completed
+  RESULT: 28,40,statefulset-sequential,75.935s,378ms,203ms,38.722s,35.785s,847ms,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-sequential-r40-n28" deleted
+  Waiting for consumer-0............pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-sequential rate=100 run=53 ===
+deployment.apps/message-producer env updated
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-sequential-r100-n53 created
+  Waiting.............................. Completed
+  RESULT: 53,100,statefulset-sequential,159.279s,476ms,190ms,38.09s,2m0.179s,344ms,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-sequential-r100-n53" deleted
+  Waiting for consumer-0............pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-sequential rate=120 run=62 ===
+deployment.apps/message-producer env updated
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-sequential-r120-n62 created
+  Waiting............................. Completed
+  RESULT: 62,120,statefulset-sequential,160.728s,370ms,202ms,38.577s,2m0.667s,912ms,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-sequential-r120-n62" deleted
+  Waiting for consumer-0.............pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-shadowpod rate=10 run=1 ===
+deployment.apps/message-producer env updated
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-shadowpod-r10-n1 created
+  Waiting...... Completed
+  RESULT: 1,10,statefulset-shadowpod,9.719s,396ms,1.243s,2.98s,5.015s,85ms,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-shadowpod-r10-n1" deleted
+  Recovering StatefulSet...statefulset.apps/consumer scaled
+pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-shadowpod rate=20 run=15 ===
+deployment.apps/message-producer env updated
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-shadowpod-r20-n15 created
+  Waiting..... Completed
+  RESULT: 15,20,statefulset-shadowpod,9.568s,445ms,1.272s,2.247s,5.283s,321ms,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-shadowpod-r20-n15" deleted
+  Recovering StatefulSet...statefulset.apps/consumer scaled
+pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-shadowpod rate=60 run=37 ===
+deployment.apps/message-producer env updated
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-shadowpod-r60-n37 created
+  Waiting....... Completed
+  RESULT: 37,60,statefulset-shadowpod,22.847s,435ms,1.241s,3.006s,18.05s,115ms,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-shadowpod-r60-n37" deleted
+  Recovering StatefulSet...statefulset.apps/consumer scaled
+pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-shadowpod rate=80 run=46 ===
+deployment.apps/message-producer env updated
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-shadowpod-r80-n46 created
+  Waiting............. Completed
+  RESULT: 46,80,statefulset-shadowpod,49.393s,401ms,1.264s,2.181s,45.249s,298ms,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-shadowpod-r80-n46" deleted
+  Recovering StatefulSet...statefulset.apps/consumer scaled
+pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-shadowpod-swap rate=60 run=33 ===
+deployment.apps/message-producer env updated
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-shadowpod-swap-r60-n33 created
+  Waiting............ Completed
+  RESULT: 33,60,statefulset-shadowpod-swap,53.554s,367ms,1.266s,3.167s,24.231s,24.523s,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-shadowpod-swap-r60-n33" deleted
+  Recovering StatefulSet...statefulset.apps/consumer scaled
+pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-shadowpod-swap rate=100 run=52 ===
+deployment.apps/message-producer env updated
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "message-producer" rollout to finish: 1 old replicas are pending termination...
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-2 -> Target: worker-1
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-shadowpod-swap-r100-n52 created
+  Waiting......................... Completed
+  RESULT: 52,100,statefulset-shadowpod-swap,140.199s,346ms,190ms,2.823s,2m0.914s,15.926s,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-shadowpod-swap-r100-n52" deleted
+  Recovering StatefulSet...statefulset.apps/consumer scaled
+pod/consumer-0 condition met
+ ready
+
+=== Rerunning: statefulset-shadowpod-swap rate=120 run=69 ===
+deployment.apps/message-producer env updated
+deployment "message-producer" successfully rolled out
+  Source: consumer-0 on worker-1 -> Target: worker-2
+Purging queue 'app.events' in vhost '/' ...
+Deleting queue 'app.events.ms2m-replay' on vhost '/' ...
+statefulmigration.migration.ms2m.io/rerun-statefulset-shadowpod-swap-r120-n69 created
+  Waiting........................... Completed
+  RESULT: 69,120,statefulset-shadowpod-swap,141.98s,397ms,193ms,2.856s,2m0.942s,17.592s,Completed
+statefulmigration.migration.ms2m.io "rerun-statefulset-shadowpod-swap-r120-n69" deleted
+  Recovering StatefulSet...statefulset.apps/consumer scaled
+pod/consumer-0 condition met
+ ready
+
+=== Phase 2 complete (13 runs) ===
+Now switch back to Deployment manually if needed.
