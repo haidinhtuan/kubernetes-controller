@@ -17,26 +17,36 @@ SHADOW builds on the MS2M (Message-based Stateful Microservice Migration) framew
 
 ## Architecture
 
-```
-                    Kubernetes API Server
-                   /          |          \
-                  /           |           \
-      +-----------+   +---------------+   +------------+
-      |  SHADOW   |   | Transfer Job  |   |  Registry  |
-      | Operator  |   | (source node) |   |  (OCI)     |
-      +-----------+   +---------------+   +------------+
-           |                  |                  |
-           |   +-----------+  |  +-----------+   |
-           +-->| Source     |--+  | Target    |<--+
-               | Kubelet   |     | Kubelet   |
-               | (Node A)  |     | (Node B)  |
-               +-----------+     +-----------+
-                                      ^
-                                      |
-                                 +-----------+
-                                 | ms2m-agent|  (Direct transfer mode)
-                                 | DaemonSet |
-                                 +-----------+
+```mermaid
+flowchart TB
+    subgraph CP["Control Plane"]
+        OP["SHADOW Operator\n(Reconciler)"]
+        API["Kubernetes\nAPI Server"]
+    end
+
+    subgraph W1["Worker Node A (Source)"]
+        K1["Kubelet\nCRI-O + CRIU"]
+        A1["ms2m-agent"]
+        SRC["Source Pod\n(Consumer)"]
+    end
+
+    subgraph W2["Worker Node B (Target)"]
+        K2["Kubelet\nCRI-O + CRIU"]
+        A2["ms2m-agent"]
+        TGT["Shadow Pod\n(Restored)"]
+    end
+
+    subgraph MQ["Message Broker (RabbitMQ)"]
+        PQ["Primary Queue"]
+        RQ["Replay Queue"]
+    end
+
+    OP <-->|"watch/update\nStatefulMigration CR"| API
+    API -->|"1. Checkpoint"| K1
+    API -->|"3. Create shadow pod"| K2
+    A1 -.->|"2. Direct transfer\n(or via Registry)"| A2
+    SRC -->|"consume"| PQ
+    RQ -->|"replay"| TGT
 ```
 
 - **SHADOW Operator** -- Watches `StatefulMigration` custom resources and drives the phase-based state machine through each migration stage.
@@ -47,11 +57,26 @@ SHADOW builds on the MS2M (Message-based Stateful Microservice Migration) framew
 
 ## Migration Phases
 
-A `StatefulMigration` resource progresses through a state machine:
+A `StatefulMigration` resource progresses through an idempotent state machine:
 
-```
-Pending → Checkpointing → Transferring → Restoring → Replaying → Finalizing → Completed
-                                                                                (or Failed)
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Checkpointing : pod validated
+    Checkpointing --> Transferring : CRIU checkpoint
+    Transferring --> Restoring : image ready
+    Restoring --> Replaying : pod running
+    Replaying --> Finalizing : queue drained\nor cutoff
+    Finalizing --> Completed : traffic switched
+
+    Checkpointing --> Failed : error
+    Transferring --> Failed : error
+    Restoring --> Failed : error
+    Replaying --> Failed : error
+    Finalizing --> Failed : error
+
+    Completed --> [*]
+    Failed --> [*]
 ```
 
 | Phase | Description |
