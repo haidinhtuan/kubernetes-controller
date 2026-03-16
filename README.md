@@ -11,6 +11,7 @@ SHADOW is a Kubernetes operator that performs live migration of stateful microse
 SHADOW builds on the MS2M (Message-based Stateful Microservice Migration) framework [[CIoT 2022]](https://ieeexplore.ieee.org/abstract/document/9766576), [[ICIN 2025]](https://ieeexplore.ieee.org/abstract/document/10942720) and introduces three key contributions:
 
 - **ShadowPod migration strategy** -- Creates a shadow pod on the target node while the source continues serving traffic. Enables zero-downtime migration for both StatefulSet and Deployment workloads.
+- **Exchange-Fence Convergence** -- An identity swap algorithm for StatefulSet workloads that uses message broker exchange-queue topology changes as an infrastructure-level consistent-cut primitive, achieving zero state gap without application-level markers.
 - **Direct node-to-node checkpoint transfer** -- A DaemonSet agent (`ms2m-agent`) receives checkpoint archives via HTTP and loads them into the local container runtime, bypassing the OCI registry entirely.
 - **Kubernetes-native operator** -- Replaces the external Python migration manager with a declarative `StatefulMigration` custom resource and a controller-runtime reconciler.
 
@@ -184,111 +185,124 @@ config/
   manager/                             Operator Deployment manifest
   daemonset/                           ms2m-agent DaemonSet + Service
 eval/
-  results/                             Evaluation CSV data (210 runs)
+  results/                             Evaluation CSV data (280 runs, 4 configs)
   workloads/                           Consumer workload manifests
   scripts/                             Evaluation and downtime measurement scripts
 ```
 
 ## Evaluation Results
 
-Evaluated on a 3-node bare-metal Kubernetes cluster (dedicated servers from a European cloud provider, 4 vCPUs / 8 GB RAM per node, CRI-O + CRIU v4.0). Three configurations across seven message rates (10--120 msg/s), 10 repetitions each, totaling **210 migration runs**.
+Evaluated on a 3-node bare-metal Kubernetes cluster (dedicated servers from a European cloud provider, 4 vCPUs / 8 GB RAM per node, CRI-O + CRIU v4.0). Four configurations across seven message rates (10--120 msg/s), 10 repetitions each, totaling **280 migration runs**.
+
+| Config | Workload | Strategy | Identity Swap |
+|:-------|:---------|:---------|:-------------|
+| **SS-Sequential** | StatefulSet | Sequential | N/A (baseline) |
+| **SS-ShadowPod** | StatefulSet | ShadowPod | Cutoff |
+| **SS-ShadowPod-Swap** | StatefulSet | ShadowPod | Exchange-Fence |
+| **D-Registry** | Deployment | ShadowPod | N/A |
 
 ### Key Metrics
 
-| Metric | Sequential (baseline) | ShadowPod |
-|:-------|:---------------------|:----------|
-| **Service downtime** | ~31 s | **0 ms** (140/140 runs) |
-| **Restore phase** | ~38.5 s | ~2.9 s (92% reduction) |
-| **Total time @ 10 msg/s** | 50.8 s | 12.4--13.8 s (73--76% reduction) |
-| **Total time @ 120 msg/s** | 164.8 s | 129.0--129.2 s (22% reduction) |
-| **Message loss** | 0 | 0 |
+| Metric | Sequential (baseline) | ShadowPod (Cutoff) | ShadowPod (Exchange-Fence) | Deployment |
+|:-------|:---------------------|:----------|:----------|:----------|
+| **Service downtime** | ~38.5 s | **0 ms** | **0 ms** | **0 ms** |
+| **Restore phase** | ~38.6 s | ~2.9 s (92%) | ~3.0 s (92%) | ~2.8 s (93%) |
+| **Total @ 10 msg/s** | 45.4 s | 8.0 s (82%) | 15.8 s (65%) | 7.7 s (83%) |
+| **Total @ 120 msg/s** | 161.0 s | 126.7 s (21%) | 141.6 s (12%) | 125.3 s (22%) |
+| **Finalize overhead** | <1 s | <1 s | 8.6--17.5 s | <1 s |
+| **Message loss** | 0 | 0 | 0 | 0 |
 
 ### Total Migration Time
 
 ```
 Total Migration Time (seconds, median n=10)
 
-  170 ┤ ■─────────────────────────────■──■──■
+  160 ┤ ■────────────────────■──■──■
       │
-  150 ┤          ■
+  140 ┤                      ◆──◆──◆
       │
-  130 ┤                      ●───────●──●──●
-      │                      ○───────○──○──○
-  110 ┤               ●
+  120 ┤                      ●──●──●
+      │                      ○──○──○
+  100 ┤
       │
-   90 ┤         ■
+   80 ┤    ■
       │
-   70 ┤
-      │                ○
-   50 ┤■
-      │               ●
-   40 ┤
+   60 ┤         ■          ◆
+      │■                   ●
+   40 ┤■                   ○
       │
-   20 ┤●  ●  ●       ○  ○
+   20 ┤●  ●  ●  ●  ◆  ◆
+      │◆  ◆  ◆       ○
+   10 ┤●  ●  ●  ○  ○
       │○  ○  ○
     0 ┼───┬───┬───┬───┬───┬───┬───
       10  20  40  60  80 100 120  msg/s
 
-  ■ SS-Sequential    ● SS-ShadowPod    ○ D-Registry
+  ■ SS-Sequential  ● SS-ShadowPod  ◆ SS-Swap  ○ D-Registry
   ── Replay cutoff: 120s
 ```
 
-At low rates (10 msg/s), ShadowPod reduces migration time by **73--76%** (50.8s to 12.4--13.8s). The improvement comes from eliminating the ~38s StatefulSet scale-down/up cycle. At high rates (>=80 msg/s), the 120s replay cutoff dominates all configurations, narrowing the gap to ~22%.
+At low rates (10 msg/s), ShadowPod reduces migration time by **82--83%** (45.4s to 7.7--8.0s). SS-Swap adds 8--9s for the Exchange-Fence identity swap (15.8s, 65% reduction). At high rates (>=100 msg/s), the 120s replay cutoff dominates, narrowing the gap to 12--22%.
 
 ### Service Downtime
 
 ```
 Service Downtime (seconds, median n=10)
 
-   31 ┤■──■──■──■──■──■──■   Sequential: ~31s (all rates)
+ 38.5 ┤■──■──■──■──■──■──■   Sequential: ~38.5s (all rates)
       │
       │
       │
-      │
-    0 ┤●──●──●──●──●──●──●   ShadowPod:   0ms (140/140 runs)
-      ○──○──○──○──○──○──○   Deployment:  0ms (70/70 runs)
+    0 ┤●──●──●──●──●──●──●   SS-ShadowPod:  0ms (210/210 runs)
+      ◆──◆──◆──◆──◆──◆──◆   SS-Swap:       0ms (210/210 runs)
+      ○──○──○──○──○──○──○   Deployment:    0ms (70/70 runs)
       ┼───┬───┬───┬───┬───┬───┬───
       10  20  40  60  80 100 120  msg/s
 ```
 
-The ShadowPod strategy achieves **zero measured downtime** across all 140 StatefulSet-ShadowPod runs and all 70 Deployment runs. The Sequential baseline shows a consistent ~31s gap corresponding to the StatefulSet identity-constrained restore phase.
+All three ShadowPod configurations achieve **zero measured downtime** across all 210 runs. The Exchange-Fence identity swap does not introduce additional downtime because the shadow pod continues serving traffic throughout the swap procedure. The Sequential baseline shows a consistent ~38.5s gap corresponding to the restore phase.
 
 ### Phase Breakdown at 60 msg/s
 
 ```
 Phase Duration Breakdown (median seconds at 60 msg/s)
 
-SS-Sequential  |▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓████████████████████████████████████████| 157.5s
-               |ckpt|  transfer  |      restore (38.4s)      |    replay (112.8s)     |
+SS-Sequential  |▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓████████████████████████████████| 131.1s
+               |ckpt|T|      restore (38.8s)     |    replay (90.6s)     |
 
-SS-ShadowPod   |▓▓▓▓▓▓▓██|                                                    36.0s
-               |ckpt|transfer|R|  replay (27.7s) |
+SS-ShadowPod   |▓▓▓██|                                                  19.6s
+               |ckpt|T|R|  replay (14.6s)  |
 
-D-Registry     |▓▓▓▓▓▓▓▓▓▓▓▓█████|                                            58.2s
-               |ckpt|transfer|R|     replay (49.3s)    |
+SS-Swap        |▓▓▓██░░░░░░|                                            31.8s
+               |ckpt|T|R|  replay (13.4s)  | finalize (14.7s) |
 
-  ▓ Checkpoint + Transfer + Restore    █ Replay    R = Restore (~2.9s)
+D-Registry     |▓▓▓██|                                                  18.1s
+               |ckpt|T|R|  replay (12.6s) |
+
+  ▓ Checkpoint + Transfer + Restore  █ Replay  ░ Finalize (Exchange-Fence)
+  T = Transfer (<1.3s)  R = Restore (~2.9s)
 ```
 
-The restore phase -- which dominates Sequential at 38.4s -- is reduced to ~2.9s with ShadowPod (92% reduction), shifting the bottleneck entirely to the replay phase.
+The restore phase -- which dominates Sequential at 38.8s -- is reduced to ~2.9s with ShadowPod (92% reduction). SS-Swap's visible finalize overhead (14.7s) reflects the Exchange-Fence identity swap: re-checkpoint, replacement pod creation, parallel queue drain, and StatefulSet adoption.
 
 ### Conclusions
 
-- **ShadowPod eliminates service downtime** for both StatefulSet and Deployment workloads by keeping the source pod running throughout migration. Zero downtime was confirmed across all 210 ShadowPod runs.
-- **Restore phase reduction of 92%** (38.4s to 2.9s) by creating an independent shadow pod instead of waiting for the StatefulSet scale-down/up cycle.
-- **Replay is the remaining bottleneck** at high message rates. When the incoming rate exceeds the consumer's processing capacity (~65 msg/s), the replay cutoff fires and total migration time converges across all strategies.
-- **Zero message loss** was maintained across all 210 runs, confirming the correctness of the MS2M message replay mechanism with the ShadowPod extension.
+- **ShadowPod eliminates service downtime** for all three ShadowPod configurations. Zero downtime was confirmed across all 210 ShadowPod runs (SS-Shadow, SS-Swap, D-Reg).
+- **Restore phase reduction of 92%** (38.6s to 2.9s) by creating an independent shadow pod instead of waiting for the StatefulSet scale-down/up cycle.
+- **Exchange-Fence trades speed for correctness.** SS-Swap adds 9--17s finalize overhead but provides zero state gap and zero duplicate guarantees when consumer throughput exceeds the message arrival rate. The overhead is most significant at low rates (+98% vs SS-Shadow) but diminishes at high rates (+12%) where replay dominates.
+- **Replay is the remaining bottleneck** at high message rates. When the incoming rate exceeds the consumer's processing capacity (~50 msg/s), the replay cutoff fires and total migration time converges across all strategies.
+- **Zero message loss** was maintained across all 280 runs, confirming the correctness of the MS2M message replay mechanism across all four configurations.
 
 Raw evaluation data is available in [`eval/results/`](eval/results/).
 
 To reproduce the evaluation:
 
 ```bash
-# Run all 210 evaluation runs (3 configs x 7 rates x 10 reps)
+# Run all 280 evaluation runs (4 configs x 7 rates x 10 reps)
 ./eval/scripts/run_all_evaluations.sh
 
 # Run a single configuration
-./eval/scripts/run_optimized_evaluation.sh statefulset-shadowpod 10,20,40,60,80,100,120 10
+CONFIGURATION=statefulset-shadowpod-swap bash eval/scripts/run_optimized_evaluation.sh
 ```
 
 ## Publications
